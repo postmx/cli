@@ -614,6 +614,7 @@ async function promptSecret(query: string): Promise<string> {
     const cleanup = (writeNewline = true) => {
       processStdin.removeListener("data", onData);
       processStdin.setRawMode?.(Boolean(previousRawMode));
+      processStdin.pause();
       if (writeNewline) processStdout.write("\n");
     };
 
@@ -2114,5 +2115,6 @@ export {
   isMainInvocation,
   normalizeAuthSuccess,
   parseScopesFlag,
+  promptSecret,
   postCliAuthJson,
 };

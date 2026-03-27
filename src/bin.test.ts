@@ -9,6 +9,7 @@ import {
   isMainInvocation,
   normalizeAuthSuccess,
   parseScopesFlag,
+  promptSecret,
   postCliAuthJson,
 } from "./bin";
 
@@ -145,6 +146,54 @@ describe("CLI auth helpers", () => {
       expect(isMainInvocation(link, pathToFileURL(target).href)).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("pauses stdin after secret entry cleanup", async () => {
+    const stdinAny = process.stdin as NodeJS.ReadStream & {
+      isTTY?: boolean;
+      setRawMode?: (value: boolean) => void;
+      isRaw?: boolean;
+    };
+    const stdoutAny = process.stdout as NodeJS.WriteStream & { isTTY?: boolean };
+
+    const originalIsTTYIn = stdinAny.isTTY;
+    const originalIsTTYOut = stdoutAny.isTTY;
+    const originalSetRawMode = stdinAny.setRawMode;
+    const originalPause = process.stdin.pause;
+    const originalResume = process.stdin.resume;
+    const originalSetEncoding = process.stdin.setEncoding;
+
+    const setRawMode = vi.fn();
+    const pause = vi.fn();
+    const resume = vi.fn();
+    const setEncoding = vi.fn();
+
+    stdinAny.isTTY = true;
+    stdoutAny.isTTY = true;
+    stdinAny.isRaw = false;
+    stdinAny.setRawMode = setRawMode;
+    process.stdin.pause = pause as typeof process.stdin.pause;
+    process.stdin.resume = resume as typeof process.stdin.resume;
+    process.stdin.setEncoding = setEncoding as typeof process.stdin.setEncoding;
+
+    try {
+      const pending = promptSecret("OTP: ");
+      process.stdin.emit("data", "123456\n");
+
+      await expect(pending).resolves.toBe("123456");
+      expect(resume).toHaveBeenCalled();
+      expect(setEncoding).toHaveBeenCalledWith("utf8");
+      expect(setRawMode).toHaveBeenCalledWith(true);
+      expect(setRawMode).toHaveBeenLastCalledWith(false);
+      expect(pause).toHaveBeenCalled();
+    } finally {
+      stdinAny.isTTY = originalIsTTYIn;
+      stdoutAny.isTTY = originalIsTTYOut;
+      stdinAny.setRawMode = originalSetRawMode;
+      process.stdin.pause = originalPause;
+      process.stdin.resume = originalResume;
+      process.stdin.setEncoding = originalSetEncoding;
     }
   });
 });
