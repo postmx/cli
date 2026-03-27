@@ -3,12 +3,15 @@ import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { PostMXApiError, PostMXNetworkError } from "postmx";
 import {
+  createInboxWithRetry,
   createCallbackListener,
   formatCliApiError,
   isMainInvocation,
   normalizeAuthSuccess,
   parseScopesFlag,
+  parseTemporaryInboxTtl,
   promptSecret,
   postCliAuthJson,
 } from "./bin";
@@ -20,6 +23,7 @@ const CLI_VERSION = JSON.parse(
 describe("CLI auth helpers", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   it("parses comma-separated scopes", () => {
@@ -28,6 +32,56 @@ describe("CLI auth helpers", () => {
       "inboxes:write",
     ]);
     expect(parseScopesFlag(undefined)).toBeUndefined();
+  });
+
+  it("defaults temporary inbox ttl to 30 minutes", () => {
+    expect(parseTemporaryInboxTtl(undefined)).toBe(30);
+    expect(parseTemporaryInboxTtl("")).toBe(30);
+    expect(parseTemporaryInboxTtl("45")).toBe(45);
+  });
+
+  it("retries inbox creation with a fresh idempotency key", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    const createInbox = vi.fn()
+      .mockRejectedValueOnce(new PostMXApiError(
+        409,
+        "idempotency_conflict",
+        "A request with this Idempotency-Key is already in progress.",
+        "req_busy",
+      ))
+      .mockResolvedValueOnce({ id: "inb_123", email_address: "test@example.com" });
+
+    const pending = createInboxWithRetry(
+      { createInbox } as never,
+      { label: "test", lifecycle_mode: "temporary", ttl_minutes: 30 },
+    );
+
+    await vi.runAllTimersAsync();
+
+    await expect(pending).resolves.toMatchObject({ id: "inb_123" });
+    expect(createInbox).toHaveBeenCalledTimes(2);
+    expect(createInbox.mock.calls[0]?.[1]?.idempotencyKey).toBeDefined();
+    expect(createInbox.mock.calls[1]?.[1]?.idempotencyKey).toBeDefined();
+    expect(createInbox.mock.calls[0]?.[1]?.idempotencyKey).not.toBe(createInbox.mock.calls[1]?.[1]?.idempotencyKey);
+  });
+
+  it("retries inbox creation after a network error", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    const createInbox = vi.fn()
+      .mockRejectedValueOnce(new PostMXNetworkError(new Error("fetch failed")))
+      .mockResolvedValueOnce({ id: "inb_456", email_address: "test@example.com" });
+
+    const pending = createInboxWithRetry(
+      { createInbox } as never,
+      { label: "test", lifecycle_mode: "temporary", ttl_minutes: 30 },
+    );
+
+    await vi.runAllTimersAsync();
+
+    await expect(pending).resolves.toMatchObject({ id: "inb_456" });
+    expect(createInbox).toHaveBeenCalledTimes(2);
   });
 
   it("sends required CLI auth headers", async () => {

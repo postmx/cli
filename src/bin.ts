@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { stdin as processStdin, stdout as processStdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { PostMX, PostMXApiError } from "postmx";
+import { PostMX, PostMXApiError, PostMXNetworkError, type Inbox } from "postmx";
 
 const DEFAULT_BASE_URL = "https://api.postmx.co";
 const DEFAULT_CLI_VERSION = "0.1.1";
@@ -20,6 +20,10 @@ const CLI_AUTH_DEFAULT_LABEL = "PostMX CLI";
 const CLI_AUTH_NEXT_DASHBOARD_PATH = "/auth/cli/complete";
 const CLI_KEYCHAIN_SERVICE = "co.postmx.cli";
 const CLI_KEYCHAIN_ACCOUNT = "default";
+const DEFAULT_TEMPORARY_INBOX_TTL_MINUTES = 30;
+const CREATE_INBOX_RETRY_TIMEOUT_MS = 90_000;
+const CREATE_INBOX_ATTEMPT_TIMEOUT_MS = 20_000;
+const CREATE_INBOX_RETRY_DELAY_MS = 2_000;
 
 function resolveCliVersion(): string {
   try {
@@ -321,6 +325,18 @@ function validateIso8601(value: string): string {
     die(`Invalid --expires-at value: ${JSON.stringify(value)}`);
   }
   return parsed.toISOString();
+}
+
+function parseTemporaryInboxTtl(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") {
+    return DEFAULT_TEMPORARY_INBOX_TTL_MINUTES;
+  }
+
+  const ttl = Number.parseInt(value, 10);
+  if (!Number.isInteger(ttl) || ttl < 10 || ttl > 60) {
+    die("Temporary inbox TTL must be an integer between 10 and 60 minutes.");
+  }
+  return ttl;
 }
 
 function randomState(): string {
@@ -1147,15 +1163,74 @@ async function authLogout(flags: Record<string, string | true>): Promise<void> {
   }
 }
 
+async function createInboxWithRetry(
+  client: PostMX,
+  params: { label: string; lifecycle_mode: "temporary" | "persistent"; ttl_minutes?: number },
+): Promise<Inbox> {
+  const reflectiveClient = client as unknown as Record<string, unknown>;
+  const apiKey = typeof reflectiveClient["apiKey"] === "string" ? reflectiveClient["apiKey"] : undefined;
+  const baseUrl = typeof reflectiveClient["baseUrl"] === "string" ? reflectiveClient["baseUrl"] : undefined;
+  const provisioningClient = apiKey
+    ? new PostMX(apiKey, { baseUrl, maxRetries: 0, timeout: CREATE_INBOX_ATTEMPT_TIMEOUT_MS })
+    : client;
+  const deadline = Date.now() + CREATE_INBOX_RETRY_TIMEOUT_MS;
+  let lastError: Error | undefined;
+
+  while (Date.now() < deadline) {
+    try {
+      return await provisioningClient.createInbox(params, { idempotencyKey: randomUUID() });
+    } catch (error) {
+      if (error instanceof PostMXNetworkError) {
+        lastError = error;
+
+        if (Date.now() + CREATE_INBOX_RETRY_DELAY_MS >= deadline) {
+          break;
+        }
+
+        await sleep(CREATE_INBOX_RETRY_DELAY_MS);
+        continue;
+      }
+
+      if (!(error instanceof PostMXApiError)) {
+        throw error;
+      }
+
+      lastError = error;
+
+      const isProvisioningRetry = error.code === "idempotency_conflict"
+        || error.code === "transient_failure"
+        || error.code === "rate_limited";
+
+      if (!isProvisioningRetry) {
+        throw error;
+      }
+
+      const retryDelay = error.retryAfterSeconds
+        ? Math.max(CREATE_INBOX_RETRY_DELAY_MS, error.retryAfterSeconds * 1000)
+        : CREATE_INBOX_RETRY_DELAY_MS;
+
+      if (Date.now() + retryDelay >= deadline) {
+        break;
+      }
+
+      await sleep(retryDelay);
+    }
+  }
+
+  throw lastError ?? new Error("Inbox provisioning timed out.");
+}
+
 async function inboxCreate(flags: Record<string, string | true>): Promise<void> {
   const client = getClient(flags);
   const label = typeof flags["label"] === "string" ? flags["label"] : undefined;
   if (!label) die("--label is required");
 
   const lifecycle_mode = (typeof flags["lifecycle"] === "string" ? flags["lifecycle"] : "temporary") as "temporary" | "persistent";
-  const ttl = typeof flags["ttl"] === "string" ? parseInt(flags["ttl"], 10) : undefined;
+  const ttl = lifecycle_mode === "temporary"
+    ? parseTemporaryInboxTtl(typeof flags["ttl"] === "string" ? flags["ttl"] : undefined)
+    : undefined;
 
-  const inbox = await client.createInbox({ label, lifecycle_mode, ttl_minutes: ttl });
+  const inbox = await createInboxWithRetry(client, { label, lifecycle_mode, ttl_minutes: ttl });
   output(inbox, flags);
 }
 
@@ -1931,16 +2006,16 @@ async function createInboxScreen(tui: TUI, client: PostMX): Promise<boolean> {
   if (mode === "temporary") {
     clear(tui);
     w(`${bold("Create inbox")}  ${dim(label)} · ${dim(mode)}\n\n`);
-    const ttlStr = await prompt(tui, "  TTL (minutes, empty=default): ");
+    const ttlStr = await prompt(tui, `  TTL (minutes, empty=${DEFAULT_TEMPORARY_INBOX_TTL_MINUTES}): `);
     if (ttlStr === null) return true;
-    if (ttlStr) ttl = parseInt(ttlStr, 10);
+    ttl = parseTemporaryInboxTtl(ttlStr);
   }
 
   clear(tui);
   w(dim("  Creating inbox..."));
 
   try {
-    const inbox = await client.createInbox({ label, lifecycle_mode: mode, ttl_minutes: ttl });
+    const inbox = await createInboxWithRetry(client, { label, lifecycle_mode: mode, ttl_minutes: ttl });
     const lines = [
       `${bold("Inbox created")}  ${dim("esc back · q quit")}`,
       "",
@@ -2110,11 +2185,13 @@ if (isMainModule) {
 
 export {
   cliAuthHeaders,
+  createInboxWithRetry,
   createCallbackListener,
   formatCliApiError,
   isMainInvocation,
   normalizeAuthSuccess,
   parseScopesFlag,
+  parseTemporaryInboxTtl,
   promptSecret,
   postCliAuthJson,
 };
