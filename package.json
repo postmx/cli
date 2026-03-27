@@ -1,6 +1,6 @@
 {
   "name": "postmx-cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "PostMX CLI — manage inboxes, messages, and webhooks from your terminal",
   "license": "MIT",
   "repository": {

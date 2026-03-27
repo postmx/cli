@@ -1,9 +1,40 @@
+import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { PostMX } from "postmx";
+import { stdin as processStdin, stdout as processStdout } from "node:process";
+import { createInterface } from "node:readline/promises";
+import { pathToFileURL } from "node:url";
+import { PostMX, PostMXApiError } from "postmx";
 
 const DEFAULT_BASE_URL = "https://api.postmx.co";
+const DEFAULT_CLI_VERSION = "0.1.1";
+const CLI_CLIENT_NAME = "cli";
+const CLI_CALLBACK_HOST = "127.0.0.1";
+const CLI_CALLBACK_PATH = "/auth/cli/complete";
+const CLI_CALLBACK_TIMEOUT_MS = 90_000;
+const CLI_AUTH_TIMEOUT_MS = 20_000;
+const CLI_AUTH_DEFAULT_LABEL = "PostMX CLI";
+const CLI_AUTH_NEXT_DASHBOARD_PATH = "/auth/cli/complete";
+const CLI_KEYCHAIN_SERVICE = "co.postmx.cli";
+const CLI_KEYCHAIN_ACCOUNT = "default";
+
+function resolveCliVersion(): string {
+  try {
+    const packageJson = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version?: unknown };
+    return typeof packageJson.version === "string" && packageJson.version.trim().length > 0
+      ? packageJson.version.trim()
+      : DEFAULT_CLI_VERSION;
+  } catch {
+    return DEFAULT_CLI_VERSION;
+  }
+}
+
+const CLI_VERSION = resolveCliVersion();
 
 // ── ANSI ────────────────────────────────────────────────────────────────────
 
@@ -35,8 +66,109 @@ type MessageFeedResult = {
   pageInfo: { has_more: boolean; next_cursor: string | null };
 };
 
+type CliCredentialStore = "macos-keychain" | "linux-secret-service" | "config-file";
+
 type CliConfig = {
   apiKey?: string;
+  credentialStore?: CliCredentialStore;
+  accountId?: string;
+  accountSlug?: string;
+  email?: string;
+  keyExpiresAt?: string;
+  dashboardUrl?: string;
+  dashboardBillingUrl?: string;
+};
+
+type SavedAuthMetadata = {
+  accountId?: string;
+  accountSlug?: string;
+  email?: string;
+  keyExpiresAt?: string;
+  dashboardUrl?: string;
+  dashboardBillingUrl?: string;
+};
+
+type SavedCredentialLocation = {
+  store: CliCredentialStore;
+  location: string;
+};
+
+type CliAuthStartResponse = {
+  auth_request_id?: string;
+  challenge_id?: string;
+  expires_at?: string;
+  masked_email?: string;
+  email?: string;
+  delivery_methods?: unknown;
+  [key: string]: unknown;
+};
+
+type CliAuthSuccessPayload = {
+  api_key?: string;
+  account_id?: string;
+  account_slug?: string;
+  email?: string;
+  api_key_expires_at?: string;
+  key_expires_at?: string;
+  dashboard_url?: string;
+  dashboard_billing_url?: string;
+  account?: unknown;
+  [key: string]: unknown;
+};
+
+type CliAuthNextAction = {
+  type?: string;
+  url?: string;
+  [key: string]: unknown;
+};
+
+type CliAuthFlowResult = SavedAuthMetadata & {
+  apiKey: string;
+};
+
+type CliCallbackPayload = {
+  code: string;
+  authRequestId: string;
+  state?: string;
+};
+
+type CliCallbackListener = {
+  callbackUrl: string;
+  setExpectedAuthRequestId: (authRequestId: string) => void;
+  waitForCallback: (timeoutMs: number) => Promise<CliCallbackPayload | null>;
+  close: () => Promise<void>;
+};
+
+class CliApiError extends Error {
+  public readonly status: number;
+  public readonly code: string;
+  public readonly requestId?: string;
+  public readonly retryAfterSeconds?: number;
+  public readonly nextAction?: CliAuthNextAction;
+
+  constructor(params: {
+    status: number;
+    code: string;
+    message: string;
+    requestId?: string;
+    retryAfterSeconds?: number;
+    nextAction?: CliAuthNextAction;
+  }) {
+    super(params.message);
+    this.name = "CliApiError";
+    this.status = params.status;
+    this.code = params.code;
+    this.requestId = params.requestId;
+    this.retryAfterSeconds = params.retryAfterSeconds;
+    this.nextAction = params.nextAction;
+  }
+}
+
+class LoginRestartRequiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LoginRestartRequiredError";
+  }
 };
 
 function normalizeBaseUrl(baseUrl?: string | null, fallback = DEFAULT_BASE_URL): string {
@@ -65,11 +197,13 @@ postmx — CLI for the PostMX email testing API
 
 Usage:
   postmx <command> [options]
+  postmx login              Sign in with email
   postmx -i                  Launch interactive mode
 
 Commands:
-  auth login     Save an API key locally for future CLI use
-  auth logout    Remove the locally saved API key
+  login           Sign in or create an account with email
+  auth login      Sign in or save an API key locally
+  auth logout     Remove the locally saved API key
   inbox create    Create a new inbox
   inbox list-msg  List messages in an inbox
   inbox wait      Poll an inbox until a message arrives
@@ -81,11 +215,17 @@ Global options:
   --api-key <key>          API key (or set POSTMX_API_KEY env var or saved CLI config)
   --base-url <url>         Override API base URL
   --content-mode <mode>    Response mode: full (default), otp, links, text_only
+  --email <email>          Email address to use for login
+  --no-browser             Disable localhost callback and browser auto-complete
+  --scopes <csv>           Comma-separated scopes for login
+  --label <text>           Label for the API key created during login
+  --expires-at <iso8601>   Optional API key expiry for login
   --json                   Force JSON output (default when piped)
   -i, --interactive        Launch interactive TUI
   --help, -h               Show this help
 
 Examples:
+  postmx login
   postmx auth login --api-key pmx_live_...
   postmx -i
   postmx inbox create --label ci-test --lifecycle temporary --ttl 15
@@ -124,6 +264,69 @@ function parseArgs(argv: string[]): { positional: string[]; flags: Record<string
   return { positional, flags };
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function requestIdSuffix(requestId?: string): string {
+  return requestId ? ` (request_id: ${requestId})` : "";
+}
+
+function isDebugEnabled(flags: Record<string, string | true>): boolean {
+  return flags["debug"] === true || process.env.POSTMX_DEBUG === "1";
+}
+
+function isInteractivePromptAvailable(): boolean {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+function cliAuthHeaders(): Record<string, string> {
+  return {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "User-Agent": `postmx-cli/${CLI_VERSION}`,
+    "X-PostMX-Client": CLI_CLIENT_NAME,
+    "X-PostMX-Client-Version": CLI_VERSION,
+  };
+}
+
+function parseScopesFlag(scopes: string | true | undefined): string[] | undefined {
+  if (typeof scopes !== "string") return undefined;
+  const values = scopes
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  return values.length > 0 ? values : undefined;
+}
+
+function validateEmail(value: string): string {
+  const email = value.trim();
+  if (!email.includes("@") || email.startsWith("@") || email.endsWith("@")) {
+    die("Please enter a valid email address.");
+  }
+  return email;
+}
+
+function validateIso8601(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    die(`Invalid --expires-at value: ${JSON.stringify(value)}`);
+  }
+  return parsed.toISOString();
+}
+
+function randomState(): string {
+  return randomBytes(24).toString("base64url");
+}
+
 function getConfigPath(): string {
   const root = process.env.XDG_CONFIG_HOME
     ? join(process.env.XDG_CONFIG_HOME, "postmx")
@@ -152,10 +355,140 @@ function clearCliConfig(): void {
   rmSync(getConfigPath(), { force: true });
 }
 
+function buildSavedConfig(
+  metadata: SavedAuthMetadata,
+  store: CliCredentialStore,
+  apiKey?: string,
+): CliConfig {
+  return {
+    ...(apiKey ? { apiKey } : {}),
+    credentialStore: store,
+    accountId: metadata.accountId,
+    accountSlug: metadata.accountSlug,
+    email: metadata.email,
+    keyExpiresAt: metadata.keyExpiresAt,
+    dashboardUrl: metadata.dashboardUrl,
+    dashboardBillingUrl: metadata.dashboardBillingUrl,
+  };
+}
+
+function tryMacosKeychainRead(): string | undefined {
+  if (process.platform !== "darwin") return undefined;
+  try {
+    const output = execFileSync(
+      "security",
+      ["find-generic-password", "-a", CLI_KEYCHAIN_ACCOUNT, "-s", CLI_KEYCHAIN_SERVICE, "-w"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    ).trim();
+    return output.length > 0 ? output : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryMacosKeychainWrite(apiKey: string): SavedCredentialLocation | undefined {
+  if (process.platform !== "darwin") return undefined;
+  try {
+    execFileSync(
+      "security",
+      ["add-generic-password", "-U", "-a", CLI_KEYCHAIN_ACCOUNT, "-s", CLI_KEYCHAIN_SERVICE, "-w"],
+      {
+        input: `${apiKey}\n${apiKey}\n`,
+        encoding: "utf8",
+        stdio: ["pipe", "ignore", "pipe"],
+      },
+    );
+    return { store: "macos-keychain", location: "macOS Keychain" };
+  } catch {
+    return undefined;
+  }
+}
+
+function tryMacosKeychainDelete(): void {
+  if (process.platform !== "darwin") return;
+  try {
+    execFileSync(
+      "security",
+      ["delete-generic-password", "-a", CLI_KEYCHAIN_ACCOUNT, "-s", CLI_KEYCHAIN_SERVICE],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+  } catch {
+    // Ignore missing-key errors during logout.
+  }
+}
+
+function tryLinuxSecretStoreRead(): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const output = execFileSync(
+      "secret-tool",
+      ["lookup", "service", CLI_KEYCHAIN_SERVICE, "account", CLI_KEYCHAIN_ACCOUNT],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    ).trim();
+    return output.length > 0 ? output : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function tryLinuxSecretStoreWrite(apiKey: string): SavedCredentialLocation | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    execFileSync(
+      "secret-tool",
+      ["store", "--label=PostMX CLI API key", "service", CLI_KEYCHAIN_SERVICE, "account", CLI_KEYCHAIN_ACCOUNT],
+      { input: apiKey, encoding: "utf8", stdio: ["pipe", "ignore", "pipe"] },
+    );
+    return { store: "linux-secret-service", location: "Secret Service keyring" };
+  } catch {
+    return undefined;
+  }
+}
+
+function tryLinuxSecretStoreDelete(): void {
+  if (process.platform !== "linux") return;
+  try {
+    execFileSync(
+      "secret-tool",
+      ["clear", "service", CLI_KEYCHAIN_SERVICE, "account", CLI_KEYCHAIN_ACCOUNT],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+  } catch {
+    // Ignore missing-key errors during logout.
+  }
+}
+
+function readStoredApiKeyFromSecureStore(): string | undefined {
+  return tryMacosKeychainRead() ?? tryLinuxSecretStoreRead();
+}
+
+function saveApiKey(
+  apiKey: string,
+  metadata: SavedAuthMetadata = {},
+): SavedCredentialLocation {
+  const keychainLocation = tryMacosKeychainWrite(apiKey) ?? tryLinuxSecretStoreWrite(apiKey);
+  if (keychainLocation) {
+    writeCliConfig(buildSavedConfig(metadata, keychainLocation.store));
+    return keychainLocation;
+  }
+
+  const configPath = getConfigPath();
+  writeCliConfig(buildSavedConfig(metadata, "config-file", apiKey));
+  return { store: "config-file", location: configPath };
+}
+
+function clearSavedApiKey(): void {
+  tryMacosKeychainDelete();
+  tryLinuxSecretStoreDelete();
+  clearCliConfig();
+}
+
 function resolveApiKey(flags: Record<string, string | true>): string | undefined {
   const flagKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
   if (flagKey) return flagKey;
   if (process.env.POSTMX_API_KEY) return process.env.POSTMX_API_KEY;
+  const secureStoreKey = readStoredApiKeyFromSecureStore();
+  if (secureStoreKey) return secureStoreKey;
   const storedKey = readCliConfig().apiKey;
   return typeof storedKey === "string" && storedKey.length > 0 ? storedKey : undefined;
 }
@@ -170,12 +503,19 @@ function getClient(flags: Record<string, string | true>): PostMX {
   const apiKey = resolveApiKey(flags);
 
   if (!apiKey) {
-    die("Missing API key. Pass --api-key, set POSTMX_API_KEY, or run `postmx auth login --api-key <key>`.");
+    die("Missing API key. Pass --api-key, set POSTMX_API_KEY, or run `postmx login`.");
   }
 
   if (typeof flags["api-key"] === "string") {
     try {
-      writeCliConfig({ ...readCliConfig(), apiKey });
+      saveApiKey(apiKey, {
+        accountId: readCliConfig().accountId,
+        accountSlug: readCliConfig().accountSlug,
+        email: readCliConfig().email,
+        keyExpiresAt: readCliConfig().keyExpiresAt,
+        dashboardUrl: readCliConfig().dashboardUrl,
+        dashboardBillingUrl: readCliConfig().dashboardBillingUrl,
+      });
     } catch (err) {
       console.error(dim(`Warning: could not save API key locally (${err instanceof Error ? err.message : String(err)})`));
     }
@@ -212,7 +552,7 @@ async function listMessagesByRecipientCompat(
     ? normalizeBaseUrl(reflectiveClient["baseUrl"], DEFAULT_BASE_URL)
     : normalizeBaseUrl(process.env.POSTMX_BASE_URL, DEFAULT_BASE_URL);
   if (!apiKey) {
-    throw new Error("Missing API key. Pass --api-key, set POSTMX_API_KEY, or run `postmx auth login --api-key <key>`.");
+    throw new Error("Missing API key. Pass --api-key, set POSTMX_API_KEY, or run `postmx login`.");
   }
 
   const url = new URL("/v1/messages", baseUrl);
@@ -225,7 +565,7 @@ async function listMessagesByRecipientCompat(
     headers: {
       "Authorization": `Bearer ${apiKey}`,
       "Accept": "application/json",
-      "User-Agent": "postmx-cli/0.1.1",
+      "User-Agent": `postmx-cli/${CLI_VERSION}`,
     },
   });
 
@@ -276,28 +616,552 @@ function printPretty(data: unknown, indent = 0): void {
   }
 }
 
+async function promptLine(query: string): Promise<string> {
+  const rl = createInterface({ input: processStdin, output: processStdout });
+  try {
+    return (await rl.question(query)).trim();
+  } finally {
+    rl.close();
+  }
+}
+
+async function promptSecret(query: string): Promise<string> {
+  if (!isInteractivePromptAvailable() || typeof process.stdin.setRawMode !== "function") {
+    die("Secure code entry requires an interactive terminal.");
+  }
+
+  processStdout.write(query);
+  processStdin.resume();
+  processStdin.setEncoding("utf8");
+
+  return await new Promise<string>((resolve, reject) => {
+    let value = "";
+    const previousRawMode = processStdin.isRaw;
+
+    const cleanup = (writeNewline = true) => {
+      processStdin.removeListener("data", onData);
+      processStdin.setRawMode?.(Boolean(previousRawMode));
+      if (writeNewline) processStdout.write("\n");
+    };
+
+    const onData = (chunk: string | Buffer) => {
+      for (const char of String(chunk)) {
+        if (char === "\x03") {
+          cleanup(false);
+          reject(new Error("Login cancelled."));
+          return;
+        }
+        if (char === "\r" || char === "\n") {
+          cleanup();
+          resolve(value.trim());
+          return;
+        }
+        if (char === "\x7f" || char === "\b") {
+          value = value.slice(0, -1);
+          continue;
+        }
+        if (char === "\x1b") {
+          cleanup(false);
+          reject(new Error("Login cancelled."));
+          return;
+        }
+        if (char.length === 1 && char.charCodeAt(0) >= 32) {
+          value += char;
+        }
+      }
+    };
+
+    processStdin.setRawMode?.(true);
+    processStdin.on("data", onData);
+  });
+}
+
+async function promptForEmail(flags: Record<string, string | true>): Promise<string> {
+  if (typeof flags["email"] === "string") {
+    return validateEmail(flags["email"]);
+  }
+  if (!isInteractivePromptAvailable()) {
+    die("--email is required when stdin/stdout is not interactive.");
+  }
+  return validateEmail(await promptLine("Email: "));
+}
+
+async function promptForChoice(
+  title: string,
+  options: string[],
+): Promise<number> {
+  if (!isInteractivePromptAvailable()) {
+    return 0;
+  }
+
+  console.log(title);
+  for (let index = 0; index < options.length; index++) {
+    console.log(`  ${index + 1}. ${options[index]}`);
+  }
+
+  while (true) {
+    const answer = (await promptLine(`Choose 1-${options.length}: `)).trim().toLowerCase();
+    const numeric = Number.parseInt(answer, 10);
+    if (Number.isInteger(numeric) && numeric >= 1 && numeric <= options.length) {
+      return numeric - 1;
+    }
+    if (answer === "otp" || answer === "code") return 0;
+    if (answer === "browser" || answer === "magic-link" || answer === "magic") {
+      return Math.min(1, options.length - 1);
+    }
+    console.log(`Please enter a number between 1 and ${options.length}.`);
+  }
+}
+
+function describeDeliveryMethods(deliveryMethods: unknown): string[] {
+  if (!Array.isArray(deliveryMethods)) return [];
+  return deliveryMethods.flatMap((method) => {
+    if (typeof method === "string") return [method];
+    if (isRecord(method)) {
+      return [asNonEmptyString(method.type) ?? asNonEmptyString(method.name)].filter((value): value is string => Boolean(value));
+    }
+    return [];
+  });
+}
+
+async function postCliAuthJson<T>(
+  flags: Record<string, string | true>,
+  path: string,
+  body: Record<string, unknown>,
+): Promise<T> {
+  const baseUrl = resolveBaseUrl(flags) ?? DEFAULT_BASE_URL;
+  const url = new URL(path, baseUrl);
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: cliAuthHeaders(),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(CLI_AUTH_TIMEOUT_MS),
+    });
+  } catch (error) {
+    throw new Error(`Network error while contacting PostMX: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const json = await response.json().catch(() => null) as Record<string, unknown> | null;
+
+  if (!response.ok) {
+    const errorBody = isRecord(json?.error) ? json.error : {};
+    throw new CliApiError({
+      status: response.status,
+      code: asNonEmptyString(errorBody.code) ?? `http_${response.status}`,
+      message: asNonEmptyString(errorBody.message) ?? response.statusText,
+      requestId: asNonEmptyString(json?.request_id) ?? response.headers.get("x-request-id") ?? undefined,
+      retryAfterSeconds: typeof errorBody.retry_after_seconds === "number"
+        ? errorBody.retry_after_seconds
+        : undefined,
+      nextAction: isRecord(json?.next_action) ? json?.next_action as CliAuthNextAction : undefined,
+    });
+  }
+
+  return (json ?? {}) as T;
+}
+
+function formatCliApiError(error: CliApiError): string {
+  switch (error.code) {
+    case "invalid_client":
+    case "unsupported_client_version":
+      return `This version of postmx-cli is not supported. Please upgrade and try again${requestIdSuffix(error.requestId)}.`;
+    case "challenge_expired":
+    case "too_many_attempts":
+      return `This sign-in attempt expired or hit the retry limit. Start a new login with \`postmx login\`${requestIdSuffix(error.requestId)}.`;
+    case "invalid_exchange_code":
+      return `That one-time browser code is no longer valid. Retry the magic-link flow or restart login${requestIdSuffix(error.requestId)}.`;
+    case "rate_limited":
+      return `PostMX rate limited this login attempt. Try again${error.retryAfterSeconds ? ` in ${error.retryAfterSeconds}s` : " shortly"}${requestIdSuffix(error.requestId)}.`;
+    default:
+      return `${error.message}${requestIdSuffix(error.requestId)}`;
+  }
+}
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  return address === "::1"
+    || address === "127.0.0.1"
+    || address === "::ffff:127.0.0.1";
+}
+
+async function createCallbackListener(expectedState: string): Promise<CliCallbackListener> {
+  let expectedAuthRequestId: string | undefined;
+  let server: Server | undefined;
+  let resolved = false;
+  let closed = false;
+  let resolveCallback: ((payload: CliCallbackPayload) => void) | undefined;
+  const callbackPromise = new Promise<CliCallbackPayload>((resolve) => {
+    resolveCallback = resolve;
+  });
+
+  const closeServer = async (): Promise<void> => {
+    if (!server || closed) return;
+    if (!server.listening) {
+      closed = true;
+      return;
+    }
+    await new Promise<void>((resolve) => server?.close(() => {
+      closed = true;
+      resolve();
+    }));
+  };
+
+  server = createServer((request, response) => {
+    if (!isLoopbackAddress(request.socket.remoteAddress ?? undefined)) {
+      response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Loopback requests only.");
+      return;
+    }
+
+    const url = new URL(request.url ?? "/", `http://${request.headers.host ?? `${CLI_CALLBACK_HOST}:0`}`);
+    if (url.pathname !== CLI_CALLBACK_PATH) {
+      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Not found.");
+      return;
+    }
+
+    const code = asNonEmptyString(url.searchParams.get("code"));
+    const authRequestId = asNonEmptyString(url.searchParams.get("auth_request_id"));
+    const state = asNonEmptyString(url.searchParams.get("state"));
+
+    if (!code || !authRequestId) {
+      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Missing code or auth_request_id.");
+      return;
+    }
+    if (state !== expectedState) {
+      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Invalid callback state.");
+      return;
+    }
+    if (expectedAuthRequestId && authRequestId !== expectedAuthRequestId) {
+      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Unexpected auth request.");
+      return;
+    }
+    if (resolved) {
+      response.writeHead(409, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("Callback already received.");
+      return;
+    }
+
+    resolved = true;
+    response.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("PostMX CLI sign-in complete. You can return to your terminal.");
+    resolveCallback?.({ code, authRequestId, state });
+    void closeServer();
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server?.once("error", reject);
+    server?.listen(0, CLI_CALLBACK_HOST, () => resolve());
+  });
+
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    await closeServer();
+    throw new Error("Could not determine localhost callback port.");
+  }
+
+  return {
+    callbackUrl: `http://${CLI_CALLBACK_HOST}:${address.port}${CLI_CALLBACK_PATH}`,
+    setExpectedAuthRequestId(authRequestId: string) {
+      expectedAuthRequestId = authRequestId;
+    },
+    async waitForCallback(timeoutMs: number): Promise<CliCallbackPayload | null> {
+      return await Promise.race([
+        callbackPromise,
+        sleep(timeoutMs).then(() => null),
+      ]);
+    },
+    async close(): Promise<void> {
+      await closeServer();
+    },
+  };
+}
+
+function normalizeAuthSuccess(
+  payload: CliAuthSuccessPayload,
+  fallbackEmail?: string,
+): CliAuthFlowResult {
+  const account = isRecord(payload.account) ? payload.account : undefined;
+  const apiKey = asNonEmptyString(payload.api_key);
+  if (!apiKey) {
+    throw new Error("Login succeeded but PostMX did not return an API key.");
+  }
+
+  return {
+    apiKey,
+    accountId: asNonEmptyString(payload.account_id) ?? asNonEmptyString(account?.id),
+    accountSlug: asNonEmptyString(payload.account_slug) ?? asNonEmptyString(account?.slug),
+    email: asNonEmptyString(payload.email) ?? asNonEmptyString(account?.email) ?? fallbackEmail,
+    keyExpiresAt: asNonEmptyString(payload.api_key_expires_at) ?? asNonEmptyString(payload.key_expires_at),
+    dashboardUrl: asNonEmptyString(payload.dashboard_url),
+    dashboardBillingUrl: asNonEmptyString(payload.dashboard_billing_url),
+  };
+}
+
+async function verifyOtpLogin(
+  flags: Record<string, string | true>,
+  authRequestId: string,
+  challengeId: string,
+  email: string,
+): Promise<CliAuthFlowResult> {
+  const code = await promptSecret("6-digit OTP: ");
+  if (!/^\d{6}$/.test(code)) {
+    die("OTP codes must be exactly 6 digits.");
+  }
+
+  try {
+    const payload = await postCliAuthJson<CliAuthSuccessPayload>(flags, "/v1/auth/cli/email/verify", {
+      auth_request_id: authRequestId,
+      challenge_id: challengeId,
+      code,
+    });
+    return normalizeAuthSuccess(payload, email);
+  } catch (error) {
+    if (error instanceof CliApiError && (error.code === "challenge_expired" || error.code === "too_many_attempts")) {
+      throw new LoginRestartRequiredError(formatCliApiError(error));
+    }
+    throw error;
+  }
+}
+
+async function exchangeCliCode(
+  flags: Record<string, string | true>,
+  authRequestId: string,
+  exchangeCode: string,
+  email: string,
+): Promise<CliAuthFlowResult> {
+  try {
+    const payload = await postCliAuthJson<CliAuthSuccessPayload>(flags, "/v1/auth/cli/exchange", {
+      auth_request_id: authRequestId,
+      code: exchangeCode,
+    });
+    return normalizeAuthSuccess(payload, email);
+  } catch (error) {
+    if (error instanceof CliApiError && (error.code === "challenge_expired" || error.code === "too_many_attempts")) {
+      throw new LoginRestartRequiredError(formatCliApiError(error));
+    }
+    throw error;
+  }
+}
+
+async function promptForManualExchangeCode(
+  flags: Record<string, string | true>,
+  authRequestId: string,
+  email: string,
+): Promise<CliAuthFlowResult> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const cliCode = await promptSecret("One-time CLI code: ");
+    if (cliCode.length === 0) {
+      console.log("Please paste the one-time code shown in the dashboard.");
+      continue;
+    }
+
+    try {
+      return await exchangeCliCode(flags, authRequestId, cliCode, email);
+    } catch (error) {
+      if (error instanceof CliApiError && error.code === "invalid_exchange_code" && attempt === 0) {
+        console.log(formatCliApiError(error));
+        console.log("Open the magic link from your email again, then paste the new one-time code from the dashboard.");
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw new Error("Could not complete browser sign-in.");
+}
+
+async function completeBrowserLogin(
+  flags: Record<string, string | true>,
+  authRequestId: string,
+  callbackListener: CliCallbackListener | undefined,
+  email: string,
+): Promise<CliAuthFlowResult> {
+  if (callbackListener) {
+    console.log(`Open the magic link from your email in a browser. Waiting for a localhost callback on ${callbackListener.callbackUrl} …`);
+    const callback = await callbackListener.waitForCallback(CLI_CALLBACK_TIMEOUT_MS);
+    if (callback) {
+      if (callback.authRequestId !== authRequestId) {
+        throw new Error("Received a callback for a different login attempt.");
+      }
+      try {
+        return await exchangeCliCode(flags, authRequestId, callback.code, email);
+      } catch (error) {
+        if (!(error instanceof CliApiError && error.code === "invalid_exchange_code")) {
+          throw error;
+        }
+        console.log(formatCliApiError(error));
+      }
+    } else {
+      console.log("No browser callback reached the CLI. Falling back to manual code entry.");
+    }
+  } else {
+    console.log("Open the magic link from your email in a browser. The dashboard will show a one-time CLI code.");
+  }
+
+  console.log("Paste the one-time CLI code shown in the dashboard to finish signing in.");
+  return await promptForManualExchangeCode(flags, authRequestId, email);
+}
+
+function printLoginStartMessage(
+  maskedEmail: string,
+  deliveryMethods: string[],
+): void {
+  console.log("We sent you a sign-in email with both an OTP and a magic link.");
+  console.log(`Email: ${maskedEmail}`);
+  if (deliveryMethods.length > 0) {
+    console.log(`Delivery methods: ${deliveryMethods.join(", ")}`);
+  }
+}
+
+function printLoginSuccess(
+  result: CliAuthFlowResult,
+  savedLocation: SavedCredentialLocation,
+  flags: Record<string, string | true>,
+): void {
+  if (flags["json"] === true || !process.stdout.isTTY) {
+    console.log(JSON.stringify({
+      success: true,
+      email: result.email,
+      account_id: result.accountId,
+      account_slug: result.accountSlug,
+      key_expires_at: result.keyExpiresAt,
+      credential_store: savedLocation.store,
+      stored_at: savedLocation.location,
+      config_path: getConfigPath(),
+      dashboard_url: result.dashboardUrl,
+      dashboard_billing_url: result.dashboardBillingUrl,
+    }, null, 2));
+    return;
+  }
+
+  console.log("Signed in to PostMX.");
+  if (result.email) console.log(`Email: ${result.email}`);
+  if (result.accountSlug) console.log(`Account: ${result.accountSlug}`);
+  console.log(`Stored API key in ${savedLocation.location}.`);
+}
+
+async function runEmailLogin(flags: Record<string, string | true>): Promise<void> {
+  if (!isInteractivePromptAvailable()) {
+    die("Interactive email login requires a TTY.");
+  }
+
+  const email = await promptForEmail(flags);
+  const noBrowser = flags["no-browser"] === true;
+  const scopes = parseScopesFlag(flags["scopes"]);
+  const label = typeof flags["label"] === "string" ? flags["label"].trim() : CLI_AUTH_DEFAULT_LABEL;
+  const expiresAt = typeof flags["expires-at"] === "string" ? validateIso8601(flags["expires-at"]) : undefined;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const callbackState = randomState();
+    let callbackListener: CliCallbackListener | undefined;
+
+    if (!noBrowser) {
+      try {
+        callbackListener = await createCallbackListener(callbackState);
+      } catch (error) {
+        if (isDebugEnabled(flags)) {
+          console.error(dim(`Debug: localhost callback unavailable (${error instanceof Error ? error.message : String(error)})`));
+        }
+      }
+    }
+
+    try {
+      const startPayload = await postCliAuthJson<CliAuthStartResponse>(flags, "/v1/auth/cli/email/start", {
+        email,
+        ...(scopes ? { scopes } : {}),
+        ...(label ? { label } : {}),
+        ...(expiresAt ? { expires_at: expiresAt } : {}),
+        ...(callbackListener ? {
+          localhost_callback_url: callbackListener.callbackUrl,
+          callback_state: callbackState,
+        } : {}),
+        next_dashboard_path: CLI_AUTH_NEXT_DASHBOARD_PATH,
+      });
+
+      const authRequestId = asNonEmptyString(startPayload.auth_request_id);
+      const challengeId = asNonEmptyString(startPayload.challenge_id);
+      if (!authRequestId || !challengeId) {
+        throw new Error("PostMX did not return the required auth request details.");
+      }
+
+      callbackListener?.setExpectedAuthRequestId(authRequestId);
+
+      const maskedEmail = asNonEmptyString(startPayload.masked_email) ?? asNonEmptyString(startPayload.email) ?? email;
+      printLoginStartMessage(maskedEmail, describeDeliveryMethods(startPayload.delivery_methods));
+
+      const choice = await promptForChoice(
+        noBrowser || !callbackListener
+          ? "How would you like to finish signing in?"
+          : "Choose a sign-in method:",
+        noBrowser || !callbackListener
+          ? ["Enter OTP now", "Use magic link in browser and paste the one-time code"]
+          : ["Enter OTP now", "Open magic link in browser"],
+      );
+
+      const result = choice === 0
+        ? await verifyOtpLogin(flags, authRequestId, challengeId, email)
+        : await completeBrowserLogin(flags, authRequestId, callbackListener, email);
+
+      const savedLocation = saveApiKey(result.apiKey, {
+        accountId: result.accountId,
+        accountSlug: result.accountSlug,
+        email: result.email,
+        keyExpiresAt: result.keyExpiresAt,
+        dashboardUrl: result.dashboardUrl,
+        dashboardBillingUrl: result.dashboardBillingUrl,
+      });
+      printLoginSuccess(result, savedLocation, flags);
+      return;
+    } catch (error) {
+      if (error instanceof LoginRestartRequiredError && attempt === 0) {
+        console.log(error.message);
+        console.log("Starting a fresh login attempt…");
+        continue;
+      }
+      throw error;
+    } finally {
+      await callbackListener?.close();
+    }
+  }
+
+  throw new Error("Login could not be completed. Please try again.");
+}
+
 // ── Non-interactive commands ────────────────────────────────────────────────
 
 async function authLogin(flags: Record<string, string | true>): Promise<void> {
   const apiKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
-  if (!apiKey) die("--api-key is required: postmx auth login --api-key <key>");
-
-  try {
-    writeCliConfig({ ...readCliConfig(), apiKey });
-  } catch (err) {
-    die(`Could not save API key locally: ${err instanceof Error ? err.message : String(err)}`);
+  if (apiKey) {
+    try {
+      const savedLocation = saveApiKey(apiKey, readCliConfig());
+      if (flags["json"] === true || !process.stdout.isTTY) {
+        console.log(JSON.stringify({
+          success: true,
+          credential_store: savedLocation.store,
+          stored_at: savedLocation.location,
+          config_path: getConfigPath(),
+        }, null, 2));
+      } else {
+        console.log(`Saved API key in ${savedLocation.location}.`);
+      }
+      return;
+    } catch (err) {
+      die(`Could not save API key locally: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
-  if (flags["json"] === true || !process.stdout.isTTY) {
-    console.log(JSON.stringify({ success: true, config_path: getConfigPath() }, null, 2));
-  } else {
-    console.log(`Saved API key to ${getConfigPath()}`);
-  }
+  await runEmailLogin(flags);
 }
 
 async function authLogout(flags: Record<string, string | true>): Promise<void> {
   try {
-    clearCliConfig();
+    clearSavedApiKey();
   } catch (err) {
     die(`Could not remove saved API key: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -305,7 +1169,7 @@ async function authLogout(flags: Record<string, string | true>): Promise<void> {
   if (flags["json"] === true || !process.stdout.isTTY) {
     console.log(JSON.stringify({ success: true, config_path: getConfigPath() }, null, 2));
   } else {
-    console.log(`Removed saved API key from ${getConfigPath()}`);
+    console.log("Removed saved PostMX credentials.");
   }
 }
 
@@ -1187,6 +2051,8 @@ async function main(): Promise<void> {
 
   try {
     switch (group) {
+      case "login":
+        return await authLogin(flags);
       case "inbox":
         switch (command) {
           case "create":
@@ -1237,6 +2103,15 @@ async function main(): Promise<void> {
         die(`Unknown command: ${group}. Run 'postmx --help' for usage.`);
     }
   } catch (err: unknown) {
+    if (err instanceof CliApiError) {
+      if (err.code === "plan_limit_reached" && err.nextAction?.type === "open_dashboard" && err.nextAction.url) {
+        die(`Plan limit reached. Open ${err.nextAction.url} to upgrade or manage billing${requestIdSuffix(err.requestId)}.`);
+      }
+      die(formatCliApiError(err));
+    }
+    if (err instanceof PostMXApiError) {
+      die(`${err.message}${requestIdSuffix(err.requestId)}`);
+    }
     if (err instanceof Error) {
       die(err.message);
     }
@@ -1244,4 +2119,19 @@ async function main(): Promise<void> {
   }
 }
 
-main();
+const isMainModule = process.argv[1]
+  ? import.meta.url === pathToFileURL(process.argv[1]).href
+  : false;
+
+if (isMainModule) {
+  void main();
+}
+
+export {
+  cliAuthHeaders,
+  createCallbackListener,
+  formatCliApiError,
+  normalizeAuthSuccess,
+  parseScopesFlag,
+  postCliAuthJson,
+};

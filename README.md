@@ -23,9 +23,7 @@ postmx --help
 ## Quick Start
 
 ```bash
-export POSTMX_API_KEY=pmx_live_...
-
-postmx auth login --api-key pmx_live_...
+postmx login
 postmx inbox create --label signup-test --lifecycle temporary --ttl 15
 postmx inbox wait inb_abc123 --timeout 30
 postmx message get msg_abc123 --content-mode otp
@@ -36,6 +34,7 @@ postmx message get msg_abc123 --content-mode otp
 ```bash
 postmx -i
 postmx auth logout
+postmx auth login --api-key pmx_live_...
 postmx inbox list-msg inb_abc123 --limit 20
 postmx messages list --recipient-email signup-test@postmx.email
 postmx webhook create --label app-events --target-url https://example.com/webhooks/postmx
