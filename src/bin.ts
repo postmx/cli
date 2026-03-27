@@ -1,12 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { stdin as processStdin, stdout as processStdout } from "node:process";
 import { createInterface } from "node:readline/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { PostMX, PostMXApiError } from "postmx";
 
 const DEFAULT_BASE_URL = "https://api.postmx.co";
@@ -2119,9 +2119,16 @@ async function main(): Promise<void> {
   }
 }
 
-const isMainModule = process.argv[1]
-  ? import.meta.url === pathToFileURL(process.argv[1]).href
-  : false;
+function isMainInvocation(entryArg: string | undefined, moduleUrl = import.meta.url): boolean {
+  if (!entryArg) return false;
+  try {
+    return realpathSync(fileURLToPath(moduleUrl)) === realpathSync(entryArg);
+  } catch {
+    return moduleUrl === pathToFileURL(entryArg).href;
+  }
+}
+
+const isMainModule = isMainInvocation(process.argv[1]);
 
 if (isMainModule) {
   void main();
@@ -2131,6 +2138,7 @@ export {
   cliAuthHeaders,
   createCallbackListener,
   formatCliApiError,
+  isMainInvocation,
   normalizeAuthSuccess,
   parseScopesFlag,
   postCliAuthJson,

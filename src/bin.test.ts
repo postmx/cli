@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   createCallbackListener,
   formatCliApiError,
+  isMainInvocation,
   normalizeAuthSuccess,
   parseScopesFlag,
   postCliAuthJson,
@@ -127,5 +131,20 @@ describe("CLI auth helpers", () => {
       code: "unsupported_client_version",
       requestId: "req_123",
     } as never)).toContain("Please upgrade");
+  });
+
+  it("treats symlinked entry paths as the main module", () => {
+    const dir = mkdtempSync(join(tmpdir(), "postmx-cli-"));
+    const target = join(dir, "target.js");
+    const link = join(dir, "postmx");
+
+    try {
+      writeFileSync(target, "export {};\n");
+      symlinkSync(target, link);
+
+      expect(isMainInvocation(link, pathToFileURL(target).href)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
