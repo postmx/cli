@@ -1,0 +1,38 @@
+{
+  "name": "postmx-cli",
+  "version": "0.1.0",
+  "description": "PostMX CLI — manage inboxes, messages, and webhooks from your terminal",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/postmx/cli.git"
+  },
+  "homepage": "https://github.com/postmx/cli",
+  "bugs": "https://github.com/postmx/cli/issues",
+  "author": "postmx <dev@postmx.co>",
+  "type": "module",
+  "bin": {
+    "postmx": "./dist/bin.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "postmx": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.0.0"
+  }
+}
