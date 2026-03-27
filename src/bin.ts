@@ -3,6 +3,8 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { PostMX } from "postmx";
 
+const DEFAULT_BASE_URL = "https://api.postmx.co";
+
 // ── ANSI ────────────────────────────────────────────────────────────────────
 
 const S = {
@@ -36,6 +38,25 @@ type MessageFeedResult = {
 type CliConfig = {
   apiKey?: string;
 };
+
+function normalizeBaseUrl(baseUrl?: string | null, fallback = DEFAULT_BASE_URL): string {
+  const trimmed = typeof baseUrl === "string" ? baseUrl.trim() : "";
+  const candidate = trimmed.length > 0 ? trimmed : fallback;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    die(`Invalid PostMX base URL: ${JSON.stringify(baseUrl)}`);
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    die(`Invalid PostMX base URL protocol: ${JSON.stringify(baseUrl)}`);
+  }
+
+  const normalized = parsed.toString();
+  return normalized.endsWith("/") ? normalized.slice(0, -1) : normalized;
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -140,9 +161,9 @@ function resolveApiKey(flags: Record<string, string | true>): string | undefined
 }
 
 function resolveBaseUrl(flags: Record<string, string | true>): string | undefined {
-  return typeof flags["base-url"] === "string"
-    ? flags["base-url"]
-    : process.env.POSTMX_BASE_URL;
+  const explicit = typeof flags["base-url"] === "string" ? flags["base-url"] : process.env.POSTMX_BASE_URL;
+  if (explicit === undefined || explicit.trim() === "") return undefined;
+  return normalizeBaseUrl(explicit, DEFAULT_BASE_URL);
 }
 
 function getClient(flags: Record<string, string | true>): PostMX {
@@ -188,8 +209,8 @@ async function listMessagesByRecipientCompat(
     ? reflectiveClient["apiKey"]
     : resolveApiKey({});
   const baseUrl = typeof reflectiveClient["baseUrl"] === "string"
-    ? reflectiveClient["baseUrl"]
-    : process.env.POSTMX_BASE_URL ?? "https://api.postmx.co";
+    ? normalizeBaseUrl(reflectiveClient["baseUrl"], DEFAULT_BASE_URL)
+    : normalizeBaseUrl(process.env.POSTMX_BASE_URL, DEFAULT_BASE_URL);
   if (!apiKey) {
     throw new Error("Missing API key. Pass --api-key, set POSTMX_API_KEY, or run `postmx auth login --api-key <key>`.");
   }
@@ -204,7 +225,7 @@ async function listMessagesByRecipientCompat(
     headers: {
       "Authorization": `Bearer ${apiKey}`,
       "Accept": "application/json",
-      "User-Agent": "postmx-cli/0.1.0",
+      "User-Agent": "postmx-cli/0.1.1",
     },
   });
 
