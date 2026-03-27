@@ -387,21 +387,9 @@ function tryMacosKeychainRead(): string | undefined {
 }
 
 function tryMacosKeychainWrite(apiKey: string): SavedCredentialLocation | undefined {
+  void apiKey;
   if (process.platform !== "darwin") return undefined;
-  try {
-    execFileSync(
-      "security",
-      ["add-generic-password", "-U", "-a", CLI_KEYCHAIN_ACCOUNT, "-s", CLI_KEYCHAIN_SERVICE, "-w"],
-      {
-        input: `${apiKey}\n${apiKey}\n`,
-        encoding: "utf8",
-        stdio: ["pipe", "ignore", "pipe"],
-      },
-    );
-    return { store: "macos-keychain", location: "macOS Keychain" };
-  } catch {
-    return undefined;
-  }
+  return undefined;
 }
 
 function tryMacosKeychainDelete(): void {
@@ -504,21 +492,6 @@ function getClient(flags: Record<string, string | true>): PostMX {
 
   if (!apiKey) {
     die("Missing API key. Pass --api-key, set POSTMX_API_KEY, or run `postmx login`.");
-  }
-
-  if (typeof flags["api-key"] === "string") {
-    try {
-      saveApiKey(apiKey, {
-        accountId: readCliConfig().accountId,
-        accountSlug: readCliConfig().accountSlug,
-        email: readCliConfig().email,
-        keyExpiresAt: readCliConfig().keyExpiresAt,
-        dashboardUrl: readCliConfig().dashboardUrl,
-        dashboardBillingUrl: readCliConfig().dashboardBillingUrl,
-      });
-    } catch (err) {
-      console.error(dim(`Warning: could not save API key locally (${err instanceof Error ? err.message : String(err)})`));
-    }
   }
 
   const baseUrl = resolveBaseUrl(flags);
