@@ -43,6 +43,148 @@ function resolveCliVersion(): string {
 
 const CLI_VERSION = resolveCliVersion();
 
+type CliOutputMode = "json" | "text";
+
+type CliRuntime = {
+  agent: boolean;
+  machine: boolean;
+  outputMode: CliOutputMode;
+  command: string;
+};
+
+type CliErrorShape = {
+  code: string;
+  message: string;
+  request_id: string | null;
+  retry_after_seconds: number | null;
+  next_action: CliAuthNextAction | null;
+};
+
+type CliSuccessEnvelope = {
+  ok: true;
+  command: string;
+  data: unknown;
+  request_id: string | null;
+  meta: {
+    cli_version: string;
+    output: CliOutputMode;
+    agent: boolean;
+  };
+};
+
+type CliErrorEnvelope = {
+  ok: false;
+  command: string;
+  error: CliErrorShape;
+  meta: {
+    cli_version: string;
+    output: CliOutputMode;
+    agent: boolean;
+  };
+};
+
+const EXIT_CODE = {
+  success: 0,
+  usage: 2,
+  auth: 3,
+  api: 4,
+  timeout: 5,
+  network: 6,
+  interactiveOnly: 7,
+} as const;
+
+type ExitCode = (typeof EXIT_CODE)[keyof typeof EXIT_CODE];
+
+type FlagValue = string | true;
+type CliFlags = Record<string, FlagValue>;
+
+const GLOBAL_OPTIONS = [
+  { name: "--api-key <key>", description: "API key (or set POSTMX_API_KEY env var or saved CLI config)" },
+  { name: "--base-url <url>", description: "Override API base URL" },
+  { name: "--output <mode>", description: "Output mode: json or text" },
+  { name: "--json", description: "Alias for --output json" },
+  { name: "--agent", description: "Agent-safe mode: JSON output, no prompts, no TUI, no browser flow" },
+  { name: "--content-mode <mode>", description: "Response mode: full (default), otp, links, text_only" },
+  { name: "--email <email>", description: "Email address to use for login" },
+  { name: "--no-browser", description: "Disable localhost callback and browser-assisted login completion" },
+  { name: "--scopes <csv>", description: "Comma-separated scopes for login" },
+  { name: "--label <text>", description: "Label for inbox creation or login API keys, depending on command" },
+  { name: "--expires-at <iso8601>", description: "Optional API key expiry for login" },
+  { name: "-i, --interactive", description: "Launch interactive TUI" },
+  { name: "--help, -h", description: "Show this help" },
+];
+
+const COMMAND_SPECS = [
+  {
+    name: "help",
+    description: "Show CLI help",
+    usage: "postmx help [--output json|text]",
+    examples: ["postmx help", "postmx help --json"],
+  },
+  {
+    name: "version",
+    description: "Show CLI version and machine capabilities",
+    usage: "postmx version [--output json|text]",
+    examples: ["postmx version", "postmx version --json"],
+  },
+  {
+    name: "login",
+    description: "Sign in or create an account with email",
+    usage: "postmx login [--email user@example.com]",
+    examples: ["postmx login"],
+  },
+  {
+    name: "auth login",
+    description: "Save an API key locally or start email login",
+    usage: "postmx auth login [--api-key pmx_live_...]",
+    examples: ["postmx auth login --api-key pmx_live_..."],
+  },
+  {
+    name: "auth logout",
+    description: "Remove the locally saved API key",
+    usage: "postmx auth logout",
+    examples: ["postmx auth logout"],
+  },
+  {
+    name: "inbox create",
+    description: "Create a new inbox",
+    usage: "postmx inbox create --label ci-test [--lifecycle temporary|persistent] [--ttl 15]",
+    examples: ["postmx inbox create --label ci-test --lifecycle temporary --ttl 15"],
+  },
+  {
+    name: "inbox list-msg",
+    description: "List messages in an inbox",
+    usage: "postmx inbox list-msg <inbox_id> [--limit 20] [--cursor ...]",
+    examples: ["postmx inbox list-msg inb_abc123 --limit 20"],
+  },
+  {
+    name: "inbox wait",
+    description: "Poll an inbox until a message arrives",
+    usage: "postmx inbox wait <inbox_id> [--timeout 30] [--interval 1]",
+    examples: ["postmx inbox wait inb_abc123 --timeout 30"],
+  },
+  {
+    name: "messages list",
+    description: "List messages by exact recipient email",
+    usage: "postmx messages list --recipient-email signup-test@postmx.email [--limit 20]",
+    examples: ["postmx messages list --recipient-email signup-test@postmx.email --limit 20"],
+  },
+  {
+    name: "message get",
+    description: "Get message detail",
+    usage: "postmx message get <message_id> [--content-mode full|otp|links|text_only]",
+    examples: ["postmx message get msg_abc123 --content-mode otp"],
+  },
+  {
+    name: "webhook create",
+    description: "Create a webhook",
+    usage: "postmx webhook create --label app-events --target-url https://example.com/webhooks/postmx",
+    examples: ["postmx webhook create --label app-events --target-url https://example.com/webhooks/postmx"],
+  },
+];
+
+let activeRuntime: CliRuntime | undefined;
+
 // ── ANSI ────────────────────────────────────────────────────────────────────
 
 const S = {
@@ -53,12 +195,20 @@ const S = {
   cyan: "\x1b[36m", green: "\x1b[32m", yellow: "\x1b[33m", red: "\x1b[31m",
 } as const;
 
-const bold = (s: string) => `${S.b}${s}${S.r}`;
-const dim = (s: string) => `${S.d}${s}${S.r}`;
-const cyan = (s: string) => `${S.cyan}${s}${S.r}`;
-const green = (s: string) => `${S.green}${s}${S.r}`;
-const yellow = (s: string) => `${S.yellow}${s}${S.r}`;
-const red = (s: string) => `${S.red}${s}${S.r}`;
+function colorsEnabled(): boolean {
+  return Boolean(process.stdout.isTTY && !activeRuntime?.machine);
+}
+
+function style(code: string, value: string): string {
+  return colorsEnabled() ? `${code}${value}${S.r}` : value;
+}
+
+const bold = (s: string) => style(S.b, s);
+const dim = (s: string) => style(S.d, s);
+const cyan = (s: string) => style(S.cyan, s);
+const green = (s: string) => style(S.green, s);
+const yellow = (s: string) => style(S.yellow, s);
+const red = (s: string) => style(S.red, s);
 
 function trunc(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -69,7 +219,7 @@ function fit(s: string, n: number): string {
 }
 
 async function withSpinner<T>(label: string, task: () => Promise<T>): Promise<T> {
-  if (!process.stdout.isTTY) {
+  if (!process.stdout.isTTY || activeRuntime?.agent) {
     return await task();
   }
 
@@ -212,6 +362,33 @@ class LoginRestartRequiredError extends Error {
   }
 };
 
+class CliFatalError extends Error {
+  public readonly code: string;
+  public readonly exitCode: ExitCode;
+  public readonly requestId?: string;
+  public readonly retryAfterSeconds?: number;
+  public readonly nextAction?: CliAuthNextAction;
+
+  constructor(
+    message: string,
+    options?: {
+      code?: string;
+      exitCode?: ExitCode;
+      requestId?: string;
+      retryAfterSeconds?: number;
+      nextAction?: CliAuthNextAction;
+    },
+  ) {
+    super(message);
+    this.name = "CliFatalError";
+    this.code = options?.code ?? "error";
+    this.exitCode = options?.exitCode ?? EXIT_CODE.api;
+    this.requestId = options?.requestId;
+    this.retryAfterSeconds = options?.retryAfterSeconds;
+    this.nextAction = options?.nextAction;
+  }
+}
+
 function normalizeBaseUrl(baseUrl?: string | null, fallback = DEFAULT_BASE_URL): string {
   const trimmed = typeof baseUrl === "string" ? baseUrl.trim() : "";
   const candidate = trimmed.length > 0 ? trimmed : fallback;
@@ -220,11 +397,17 @@ function normalizeBaseUrl(baseUrl?: string | null, fallback = DEFAULT_BASE_URL):
   try {
     parsed = new URL(candidate);
   } catch {
-    die(`Invalid PostMX base URL: ${JSON.stringify(baseUrl)}`);
+    die(`Invalid PostMX base URL: ${JSON.stringify(baseUrl)}`, {
+      code: "invalid_base_url",
+      exitCode: EXIT_CODE.usage,
+    });
   }
 
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    die(`Invalid PostMX base URL protocol: ${JSON.stringify(baseUrl)}`);
+    die(`Invalid PostMX base URL protocol: ${JSON.stringify(baseUrl)}`, {
+      code: "invalid_base_url_protocol",
+      exitCode: EXIT_CODE.usage,
+    });
   }
 
   const normalized = parsed.toString();
@@ -238,10 +421,14 @@ postmx beta — CLI for the PostMX email testing API
 
 Usage:
   postmx <command> [options]
-  postmx login              Sign in with email
-  postmx -i                  Launch interactive mode
+  postmx help
+  postmx version
+  postmx login
+  postmx -i
 
 Commands:
+  help            Show CLI help
+  version         Show CLI version and machine capabilities
   login           Sign in or create an account with email
   auth login      Sign in or save an API key locally
   auth logout     Remove the locally saved API key
@@ -255,19 +442,24 @@ Commands:
 Global options:
   --api-key <key>          API key (or set POSTMX_API_KEY env var or saved CLI config)
   --base-url <url>         Override API base URL
+  --output <mode>          Output mode: json or text
+  --json                   Alias for --output json
+  --agent                  Agent-safe mode: JSON output, no prompts, no TUI, no browser flow
   --content-mode <mode>    Response mode: full (default), otp, links, text_only
   --email <email>          Email address to use for login
-  --no-browser             Disable localhost callback and browser auto-complete
+  --no-browser             Disable localhost callback and browser-assisted login completion
   --scopes <csv>           Comma-separated scopes for login
   --label <text>           Label for the API key created during login
   --expires-at <iso8601>   Optional API key expiry for login
-  --json                   Force JSON output (default when piped)
   -i, --interactive        Launch interactive TUI
   --help, -h               Show this help
 
 Examples:
+  postmx help --json
+  postmx version --json
   postmx login
   postmx auth login --api-key pmx_live_...
+  POSTMX_API_KEY=pmx_live_... postmx inbox create --label ci-test --agent
   postmx -i
   postmx inbox create --label ci-test --lifecycle temporary --ttl 15
   postmx inbox wait inb_abc123 --timeout 30
@@ -275,14 +467,173 @@ Examples:
   postmx message get msg_abc123
 `.trim();
 
-function die(msg: string): never {
-  console.error(`${S.red}error:${S.r} ${msg}`);
-  process.exit(1);
+function die(
+  msg: string,
+  options?: {
+    code?: string;
+    exitCode?: ExitCode;
+    requestId?: string;
+    retryAfterSeconds?: number;
+    nextAction?: CliAuthNextAction;
+  },
+): never {
+  throw new CliFatalError(msg, options);
 }
 
-function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string | true> } {
+function isAgentMode(flags: CliFlags): boolean {
+  return flags["agent"] === true;
+}
+
+function normalizeFlags(flags: CliFlags): CliFlags {
+  const normalized: CliFlags = { ...flags };
+  if (normalized["json"] === true) {
+    normalized["output"] = "json";
+  }
+  if (typeof normalized["output"] === "string") {
+    const output = normalized["output"].trim().toLowerCase();
+    if (output !== "json" && output !== "text") {
+      die(`Invalid --output mode: ${JSON.stringify(normalized["output"])}`, {
+        code: "invalid_output_mode",
+        exitCode: EXIT_CODE.usage,
+      });
+    }
+    normalized["output"] = output;
+  }
+  if (isAgentMode(normalized)) {
+    normalized["output"] = "json";
+    normalized["no-browser"] = true;
+  }
+  return normalized;
+}
+
+function resolveOutputMode(flags: CliFlags): CliOutputMode {
+  if (isAgentMode(flags)) return "json";
+  if (flags["json"] === true) return "json";
+  if (flags["output"] === "json") return "json";
+  if (!process.stdout.isTTY) return "json";
+  return "text";
+}
+
+function createRuntime(flags: CliFlags, command: string): CliRuntime {
+  const outputMode = resolveOutputMode(flags);
+  return {
+    agent: isAgentMode(flags),
+    machine: outputMode === "json",
+    outputMode,
+    command,
+  };
+}
+
+function resolveCommandName(positional: string[], flags: CliFlags): string {
+  if (flags["help"] === true || flags["h"] === true) return "help";
+  if (flags["interactive"] === true) return "interactive";
+  if (positional.length === 0) return "help";
+
+  const [group, command] = positional;
+  if (group === "help" || group === "version" || group === "login") {
+    return group;
+  }
+  return [group, command].filter(Boolean).join(" ");
+}
+
+function getHelpData(): Record<string, unknown> {
+  return {
+    name: "postmx",
+    package: "postmx-cli",
+    title: "PostMX CLI Beta",
+    version: CLI_VERSION,
+    usage: "postmx <command> [options]",
+    beginner_workflow: [
+      "create inbox",
+      "wait for next email",
+      "read otp, links, or text",
+    ],
+    global_options: GLOBAL_OPTIONS,
+    commands: COMMAND_SPECS,
+    examples: [
+      "postmx help --json",
+      "postmx version --json",
+      "POSTMX_API_KEY=pmx_live_... postmx inbox create --label ci-test --agent",
+      "POSTMX_API_KEY=pmx_live_... postmx inbox wait inb_abc123 --agent",
+      "POSTMX_API_KEY=pmx_live_... postmx message get msg_abc123 --content-mode otp --agent",
+    ],
+  };
+}
+
+function getVersionData(): Record<string, unknown> {
+  return {
+    name: "postmx",
+    package: "postmx-cli",
+    cli_version: CLI_VERSION,
+    executable: "postmx",
+    supported_output_modes: ["json", "text"],
+    agent_mode: {
+      env_auth: "POSTMX_API_KEY",
+      no_browser: true,
+      no_prompts: true,
+      no_tui: true,
+      json_envelope: true,
+    },
+  };
+}
+
+function extractRequestId(data: unknown): string | null {
+  if (!isRecord(data)) return null;
+  return asNonEmptyString(data.request_id) ?? null;
+}
+
+function buildSuccessEnvelope(command: string, data: unknown, runtime: CliRuntime): CliSuccessEnvelope {
+  return {
+    ok: true,
+    command,
+    data,
+    request_id: extractRequestId(data),
+    meta: {
+      cli_version: CLI_VERSION,
+      output: runtime.outputMode,
+      agent: runtime.agent,
+    },
+  };
+}
+
+function buildErrorEnvelope(runtime: CliRuntime, error: CliErrorShape): CliErrorEnvelope {
+  return {
+    ok: false,
+    command: runtime.command,
+    error,
+    meta: {
+      cli_version: CLI_VERSION,
+      output: runtime.outputMode,
+      agent: runtime.agent,
+    },
+  };
+}
+
+function writeJson(value: unknown): void {
+  processStdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function emitSuccess(
+  command: string,
+  data: unknown,
+  flags: CliFlags,
+  renderText?: (data: unknown) => void,
+): void {
+  const runtime = activeRuntime ?? createRuntime(flags, command);
+  if (runtime.machine) {
+    writeJson(buildSuccessEnvelope(command, data, runtime));
+    return;
+  }
+  if (renderText) {
+    renderText(data);
+    return;
+  }
+  printPretty(data);
+}
+
+function parseArgs(argv: string[]): { positional: string[]; flags: CliFlags } {
   const positional: string[] = [];
-  const flags: Record<string, string | true> = {};
+  const flags: CliFlags = {};
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -321,6 +672,87 @@ function requestIdSuffix(requestId?: string): string {
   return requestId ? ` (request_id: ${requestId})` : "";
 }
 
+function buildTextErrorMessage(error: CliErrorShape): string {
+  if (error.code === "plan_limit_reached" && error.next_action?.type === "open_dashboard" && error.next_action.url) {
+    return `Plan limit reached. Open ${error.next_action.url} to upgrade or manage billing${requestIdSuffix(error.request_id ?? undefined)}.`;
+  }
+
+  const message = error.message;
+  return error.request_id ? `${message}${requestIdSuffix(error.request_id)}` : message;
+}
+
+function normalizeError(error: unknown): CliFatalError {
+  if (error instanceof CliFatalError) {
+    return error;
+  }
+
+  if (error instanceof CliApiError) {
+    const exitCode = error.status === 401 || error.status === 403 ? EXIT_CODE.auth : EXIT_CODE.api;
+    return new CliFatalError(formatCliApiError(error), {
+      code: error.code,
+      exitCode,
+      requestId: error.requestId,
+      retryAfterSeconds: error.retryAfterSeconds,
+      nextAction: error.nextAction,
+    });
+  }
+
+  if (error instanceof PostMXApiError) {
+    const isAuth = error.status === 401 || error.status === 403 || error.code === "invalid_api_key";
+    return new CliFatalError(error.message, {
+      code: error.code,
+      exitCode: isAuth ? EXIT_CODE.auth : EXIT_CODE.api,
+      requestId: error.requestId,
+      retryAfterSeconds: error.retryAfterSeconds,
+    });
+  }
+
+  if (error instanceof PostMXNetworkError) {
+    return new CliFatalError(error.message, {
+      code: "network_error",
+      exitCode: EXIT_CODE.network,
+      requestId: error.requestId,
+    });
+  }
+
+  if (error instanceof Error) {
+    if (/Timed out .*waiting for a message/i.test(error.message)) {
+      return new CliFatalError(error.message, {
+        code: "timeout",
+        exitCode: EXIT_CODE.timeout,
+      });
+    }
+    if (/intervalMs must be at least/i.test(error.message)) {
+      return new CliFatalError(error.message, {
+        code: "invalid_interval",
+        exitCode: EXIT_CODE.usage,
+      });
+    }
+    return new CliFatalError(error.message);
+  }
+
+  return new CliFatalError(String(error));
+}
+
+function emitFailure(error: unknown, runtime: CliRuntime): ExitCode {
+  const fatal = normalizeError(error);
+  const shape: CliErrorShape = {
+    code: fatal.code,
+    message: fatal.message,
+    request_id: fatal.requestId ?? null,
+    retry_after_seconds: fatal.retryAfterSeconds ?? null,
+    next_action: fatal.nextAction ?? null,
+  };
+
+  if (runtime.machine) {
+    writeJson(buildErrorEnvelope(runtime, shape));
+  } else {
+    console.error(`${red("error:")} ${buildTextErrorMessage(shape)}`);
+  }
+
+  return fatal.exitCode;
+}
+
 function isDebugEnabled(flags: Record<string, string | true>): boolean {
   return flags["debug"] === true || process.env.POSTMX_DEBUG === "1";
 }
@@ -351,7 +783,10 @@ function parseScopesFlag(scopes: string | true | undefined): string[] | undefine
 function validateEmail(value: string): string {
   const email = value.trim();
   if (!email.includes("@") || email.startsWith("@") || email.endsWith("@")) {
-    die("Please enter a valid email address.");
+    die("Please enter a valid email address.", {
+      code: "invalid_email",
+      exitCode: EXIT_CODE.usage,
+    });
   }
   return email;
 }
@@ -359,7 +794,10 @@ function validateEmail(value: string): string {
 function validateIso8601(value: string): string {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) {
-    die(`Invalid --expires-at value: ${JSON.stringify(value)}`);
+    die(`Invalid --expires-at value: ${JSON.stringify(value)}`, {
+      code: "invalid_expires_at",
+      exitCode: EXIT_CODE.usage,
+    });
   }
   return parsed.toISOString();
 }
@@ -380,7 +818,10 @@ function parseTemporaryInboxTtl(value: string | undefined): number | undefined {
   try {
     return validateTemporaryInboxTtl(value);
   } catch (error) {
-    die(error instanceof Error ? error.message : String(error));
+    die(error instanceof Error ? error.message : String(error), {
+      code: "invalid_ttl",
+      exitCode: EXIT_CODE.usage,
+    });
   }
 }
 
@@ -392,7 +833,10 @@ function parseLifecycleMode(
   if (normalized === "temporary" || normalized === "persistent") {
     return normalized;
   }
-  die("Lifecycle mode must be either `temporary` or `persistent`.");
+  die("Lifecycle mode must be either `temporary` or `persistent`.", {
+    code: "invalid_lifecycle_mode",
+    exitCode: EXIT_CODE.usage,
+  });
 }
 
 function finalizeCommandInput(): void {
@@ -564,27 +1008,39 @@ function clearSavedApiKey(): void {
   clearCliConfig();
 }
 
-function resolveApiKey(flags: Record<string, string | true>): string | undefined {
+function resolveApiKey(
+  flags: CliFlags,
+  options?: { allowSavedCredentials?: boolean },
+): string | undefined {
   const flagKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
   if (flagKey) return flagKey;
   if (process.env.POSTMX_API_KEY) return process.env.POSTMX_API_KEY;
+  if (options?.allowSavedCredentials === false) return undefined;
   const secureStoreKey = readStoredApiKeyFromSecureStore();
   if (secureStoreKey) return secureStoreKey;
   const storedKey = readCliConfig().apiKey;
   return typeof storedKey === "string" && storedKey.length > 0 ? storedKey : undefined;
 }
 
-function resolveBaseUrl(flags: Record<string, string | true>): string | undefined {
+function resolveBaseUrl(flags: CliFlags): string | undefined {
   const explicit = typeof flags["base-url"] === "string" ? flags["base-url"] : process.env.POSTMX_BASE_URL;
   if (explicit === undefined || explicit.trim() === "") return undefined;
   return normalizeBaseUrl(explicit, DEFAULT_BASE_URL);
 }
 
-function getClient(flags: Record<string, string | true>): PostMX {
-  const apiKey = resolveApiKey(flags);
+function getClient(flags: CliFlags): PostMX {
+  const apiKey = resolveApiKey(flags, { allowSavedCredentials: !isAgentMode(flags) });
 
   if (!apiKey) {
-    die("Missing API key. Pass --api-key, set POSTMX_API_KEY, or run `postmx login`.");
+    die(
+      isAgentMode(flags)
+        ? "Missing API key. Pass --api-key or set POSTMX_API_KEY."
+        : "Missing API key. Pass --api-key, set POSTMX_API_KEY, or run `postmx login`.",
+      {
+        code: "missing_api_key",
+        exitCode: EXIT_CODE.auth,
+      },
+    );
   }
 
   const baseUrl = resolveBaseUrl(flags);
@@ -649,13 +1105,10 @@ async function listMessagesByRecipientCompat(
   };
 }
 
-function output(data: unknown, flags: Record<string, string | true>): void {
-  const isJSON = flags["json"] === true || !process.stdout.isTTY;
-  if (isJSON) {
-    console.log(JSON.stringify(data, null, 2));
-  } else {
-    printPretty(data);
-  }
+function output(command: string, data: unknown, flags: CliFlags): void {
+  emitSuccess(command, data, flags, (value) => {
+    printPretty(value);
+  });
 }
 
 function printPretty(data: unknown, indent = 0): void {
@@ -703,7 +1156,10 @@ function renderOtpSlots(value: string, length: number): string {
 
 async function promptSecret(query: string, options?: SecretPromptOptions): Promise<string> {
   if (!isInteractivePromptAvailable() || typeof process.stdin.setRawMode !== "function") {
-    die("Secure code entry requires an interactive terminal.");
+    die("Secure code entry requires an interactive terminal.", {
+      code: "interactive_required",
+      exitCode: EXIT_CODE.interactiveOnly,
+    });
   }
 
   const renderValue = options?.renderValue ?? ((value: string) => "•".repeat(value.length));
@@ -785,7 +1241,10 @@ async function promptForEmail(flags: Record<string, string | true>): Promise<str
     return validateEmail(flags["email"]);
   }
   if (!isInteractivePromptAvailable()) {
-    die("--email is required when stdin/stdout is not interactive.");
+    die("--email is required when stdin/stdout is not interactive.", {
+      code: "missing_email",
+      exitCode: EXIT_CODE.usage,
+    });
   }
   return validateEmail(await promptLine("Email: "));
 }
@@ -1157,7 +1616,10 @@ async function verifyOtpLogin(
     renderValue: (value) => renderOtpSlots(value, 6),
   });
   if (!/^\d{6}$/.test(code)) {
-    die("OTP codes must be exactly 6 digits.");
+    die("OTP codes must be exactly 6 digits.", {
+      code: "invalid_otp",
+      exitCode: EXIT_CODE.usage,
+    });
   }
 
   try {
@@ -1282,33 +1744,35 @@ function printLoginStartMessage(
 function printLoginSuccess(
   result: CliAuthFlowResult,
   savedLocation: SavedCredentialLocation,
-  flags: Record<string, string | true>,
+  flags: CliFlags,
 ): void {
-  if (flags["json"] === true || !process.stdout.isTTY) {
-    console.log(JSON.stringify({
-      success: true,
-      email: result.email,
-      account_id: result.accountId,
-      account_slug: result.accountSlug,
-      key_expires_at: result.keyExpiresAt,
-      credential_store: savedLocation.store,
-      stored_at: savedLocation.location,
-      config_path: getConfigPath(),
-      dashboard_url: result.dashboardUrl,
-      dashboard_billing_url: result.dashboardBillingUrl,
-    }, null, 2));
-    return;
-  }
+  const payload = {
+    success: true,
+    email: result.email,
+    account_id: result.accountId,
+    account_slug: result.accountSlug,
+    key_expires_at: result.keyExpiresAt,
+    credential_store: savedLocation.store,
+    stored_at: savedLocation.location,
+    config_path: getConfigPath(),
+    dashboard_url: result.dashboardUrl,
+    dashboard_billing_url: result.dashboardBillingUrl,
+  };
 
-  console.log("Signed in to PostMX.");
-  if (result.email) console.log(`Email: ${result.email}`);
-  if (result.accountSlug) console.log(`Account: ${result.accountSlug}`);
-  console.log(`Stored API key in ${savedLocation.location}.`);
+  emitSuccess("auth login", payload, flags, () => {
+    console.log("Signed in to PostMX.");
+    if (result.email) console.log(`Email: ${result.email}`);
+    if (result.accountSlug) console.log(`Account: ${result.accountSlug}`);
+    console.log(`Stored API key in ${savedLocation.location}.`);
+  });
 }
 
-async function runEmailLogin(flags: Record<string, string | true>): Promise<void> {
+async function runEmailLogin(flags: CliFlags): Promise<void> {
   if (!isInteractivePromptAvailable()) {
-    die("Interactive email login requires a TTY.");
+    die("Interactive email login requires a TTY.", {
+      code: "interactive_required",
+      exitCode: EXIT_CODE.interactiveOnly,
+    });
   }
 
   const email = await promptForEmail(flags);
@@ -1325,7 +1789,7 @@ async function runEmailLogin(flags: Record<string, string | true>): Promise<void
       try {
         callbackListener = await createCallbackListener(callbackState);
       } catch (error) {
-        if (isDebugEnabled(flags)) {
+        if (isDebugEnabled(flags) && !activeRuntime?.machine) {
           console.error(dim(`Debug: localhost callback unavailable (${error instanceof Error ? error.message : String(error)})`));
         }
       }
@@ -1395,26 +1859,34 @@ async function runEmailLogin(flags: Record<string, string | true>): Promise<void
 
 // ── Non-interactive commands ────────────────────────────────────────────────
 
-async function authLogin(flags: Record<string, string | true>): Promise<void> {
+async function authLogin(flags: CliFlags): Promise<void> {
   try {
-    const apiKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
+    const apiKey = resolveApiKey(flags, { allowSavedCredentials: false });
     if (apiKey) {
       try {
         const savedLocation = saveApiKey(apiKey, readCliConfig());
-        if (flags["json"] === true || !process.stdout.isTTY) {
-          console.log(JSON.stringify({
-            success: true,
-            credential_store: savedLocation.store,
-            stored_at: savedLocation.location,
-            config_path: getConfigPath(),
-          }, null, 2));
-        } else {
+        emitSuccess("auth login", {
+          success: true,
+          credential_store: savedLocation.store,
+          stored_at: savedLocation.location,
+          config_path: getConfigPath(),
+        }, flags, () => {
           console.log(`Saved API key in ${savedLocation.location}.`);
-        }
+        });
         return;
       } catch (err) {
-        die(`Could not save API key locally: ${err instanceof Error ? err.message : String(err)}`);
+        die(`Could not save API key locally: ${err instanceof Error ? err.message : String(err)}`, {
+          code: "save_credentials_failed",
+          exitCode: EXIT_CODE.api,
+        });
       }
+    }
+
+    if (isAgentMode(flags)) {
+      die("Interactive login is unavailable in --agent mode. Pass --api-key or set POSTMX_API_KEY.", {
+        code: "interactive_login_unavailable",
+        exitCode: EXIT_CODE.interactiveOnly,
+      });
     }
 
     await runEmailLogin(flags);
@@ -1423,19 +1895,20 @@ async function authLogin(flags: Record<string, string | true>): Promise<void> {
   }
 }
 
-async function authLogout(flags: Record<string, string | true>): Promise<void> {
+async function authLogout(flags: CliFlags): Promise<void> {
   try {
     try {
       clearSavedApiKey();
     } catch (err) {
-      die(`Could not remove saved API key: ${err instanceof Error ? err.message : String(err)}`);
+      die(`Could not remove saved API key: ${err instanceof Error ? err.message : String(err)}`, {
+        code: "remove_credentials_failed",
+        exitCode: EXIT_CODE.api,
+      });
     }
 
-    if (flags["json"] === true || !process.stdout.isTTY) {
-      console.log(JSON.stringify({ success: true, config_path: getConfigPath() }, null, 2));
-    } else {
+    emitSuccess("auth logout", { success: true, config_path: getConfigPath() }, flags, () => {
       console.log("Removed saved PostMX credentials.");
-    }
+    });
   } finally {
     finalizeCommandInput();
   }
@@ -1501,7 +1974,7 @@ async function createInboxWithRetry(
 async function inboxCreate(flags: Record<string, string | true>): Promise<void> {
   const client = getClient(flags);
   const label = typeof flags["label"] === "string" ? flags["label"] : undefined;
-  if (!label) die("--label is required");
+  if (!label) die("--label is required", { code: "missing_label", exitCode: EXIT_CODE.usage });
 
   const lifecycle_mode = parseLifecycleMode(
     typeof flags["lifecycle"] === "string" ? flags["lifecycle"] : undefined,
@@ -1511,57 +1984,72 @@ async function inboxCreate(flags: Record<string, string | true>): Promise<void> 
     : undefined;
 
   const inbox = await createInboxWithRetry(client, { label, lifecycle_mode, ttl_minutes: ttl });
-  output(inbox, flags);
+  output("inbox create", inbox, flags);
 }
 
 async function inboxListMessages(positional: string[], flags: Record<string, string | true>): Promise<void> {
   const inboxId = positional[0];
-  if (!inboxId) die("inbox ID is required: postmx inbox list-msg <inbox_id>");
+  if (!inboxId) die("inbox ID is required: postmx inbox list-msg <inbox_id>", {
+    code: "missing_inbox_id",
+    exitCode: EXIT_CODE.usage,
+  });
 
   const client = getClient(flags);
   const limit = typeof flags["limit"] === "string" ? parseInt(flags["limit"], 10) : undefined;
   const cursor = typeof flags["cursor"] === "string" ? flags["cursor"] : undefined;
 
   const result = await client.listMessages(inboxId, { limit, cursor });
-  output(result, flags);
+  output("inbox list-msg", result, flags);
 }
 
 async function inboxWait(positional: string[], flags: Record<string, string | true>): Promise<void> {
   const inboxId = positional[0];
-  if (!inboxId) die("inbox ID is required: postmx inbox wait <inbox_id>");
+  if (!inboxId) die("inbox ID is required: postmx inbox wait <inbox_id>", {
+    code: "missing_inbox_id",
+    exitCode: EXIT_CODE.usage,
+  });
 
   const client = getClient(flags);
   const timeoutMs = typeof flags["timeout"] === "string" ? parseInt(flags["timeout"], 10) * 1000 : 60_000;
   const intervalMs = typeof flags["interval"] === "string" ? parseInt(flags["interval"], 10) * 1000 : 1_000;
 
-  if (process.stdout.isTTY) {
+  if (process.stdout.isTTY && !activeRuntime?.machine) {
     console.error(dim(`Polling inbox ${inboxId} (timeout: ${timeoutMs / 1000}s)...`));
   }
 
   const message = await client.waitForMessage(inboxId, { timeoutMs, intervalMs });
-  output(message, flags);
+  output("inbox wait", message, flags);
 }
 
 async function messagesList(flags: Record<string, string | true>): Promise<void> {
   const recipientEmail = typeof flags["recipient-email"] === "string" ? flags["recipient-email"] : undefined;
-  if (!recipientEmail) die("--recipient-email is required: postmx messages list --recipient-email <email>");
+  if (!recipientEmail) die("--recipient-email is required: postmx messages list --recipient-email <email>", {
+    code: "missing_recipient_email",
+    exitCode: EXIT_CODE.usage,
+  });
 
   const client = getClient(flags);
   const limit = typeof flags["limit"] === "string" ? parseInt(flags["limit"], 10) : undefined;
   const cursor = typeof flags["cursor"] === "string" ? flags["cursor"] : undefined;
 
   const result = await listMessagesByRecipientCompat(client, recipientEmail, { limit, cursor });
-  output(result, flags);
+  output("messages list", result, flags);
 }
 
 async function messageGet(positional: string[], flags: Record<string, string | true>): Promise<void> {
   const messageId = positional[0];
-  if (!messageId) die("message ID is required: postmx message get <message_id> [--content-mode full|otp|links|text_only]");
+  if (!messageId) die("message ID is required: postmx message get <message_id> [--content-mode full|otp|links|text_only]", {
+    code: "missing_message_id",
+    exitCode: EXIT_CODE.usage,
+  });
 
   const contentMode = typeof flags["content-mode"] === "string" ? flags["content-mode"] : undefined;
   const validModes = ["full", "otp", "links", "text_only"];
   if (contentMode && !validModes.includes(contentMode)) {
-    die(`--content-mode must be one of: ${validModes.join(", ")}`);
+    die(`--content-mode must be one of: ${validModes.join(", ")}`, {
+      code: "invalid_content_mode",
+      exitCode: EXIT_CODE.usage,
+    });
   }
 
   const client = getClient(flags);
@@ -1569,35 +2057,29 @@ async function messageGet(positional: string[], flags: Record<string, string | t
 
   if (contentMode === "otp") {
     const val = message.otp ?? null;
-    if (flags["json"] === true || !process.stdout.isTTY) {
-      console.log(JSON.stringify({ otp: val }));
-    } else {
+    emitSuccess("message get", { otp: val }, flags, () => {
       console.log(val ?? "(no OTP found)");
-    }
+    });
     return;
   }
   if (contentMode === "links") {
     const val = message.links ?? [];
-    if (flags["json"] === true || !process.stdout.isTTY) {
-      console.log(JSON.stringify({ links: val }, null, 2));
-    } else {
+    emitSuccess("message get", { links: val }, flags, () => {
       const links = val as Array<{ url: string; type: string }>;
       if (links.length === 0) console.log("(no links found)");
       else for (const l of links) console.log(`${l.type}: ${l.url}`);
-    }
+    });
     return;
   }
   if (contentMode === "text_only") {
     const val = message.text_body ?? null;
-    if (flags["json"] === true || !process.stdout.isTTY) {
-      console.log(JSON.stringify({ text_body: val }));
-    } else {
+    emitSuccess("message get", { text_body: val }, flags, () => {
       console.log(val ?? "(no text body)");
-    }
+    });
     return;
   }
 
-  output(message, flags);
+  output("message get", message, flags);
 }
 
 async function webhookCreate(flags: Record<string, string | true>): Promise<void> {
@@ -1606,11 +2088,11 @@ async function webhookCreate(flags: Record<string, string | true>): Promise<void
   const target_url = typeof flags["target-url"] === "string" ? flags["target-url"] : undefined;
   const inbox_id = typeof flags["inbox-id"] === "string" ? flags["inbox-id"] : undefined;
 
-  if (!label) die("--label is required");
-  if (!target_url) die("--target-url is required");
+  if (!label) die("--label is required", { code: "missing_label", exitCode: EXIT_CODE.usage });
+  if (!target_url) die("--target-url is required", { code: "missing_target_url", exitCode: EXIT_CODE.usage });
 
   const result = await client.createWebhook({ label, target_url, inbox_id });
-  output(result, flags);
+  output("webhook create", result, flags);
 }
 
 // ── Interactive TUI ─────────────────────────────────────────────────────────
@@ -2398,102 +2880,146 @@ async function prompt(tui: TUI, label: string): Promise<string | null> {
 
 // ── Router ──────────────────────────────────────────────────────────────────
 
-async function main(): Promise<void> {
-  const { positional, flags } = parseArgs(process.argv.slice(2));
-
-  if (flags["help"] === true || flags["h"] === true) {
-    console.log(HELP);
-    process.exit(0);
-  }
-
-  // Interactive mode: postmx -i or postmx --interactive
-  if (flags["interactive"] === true) {
-    const client = getClient(flags);
-    await interactiveMode(client);
-    return;
-  }
-
-  // No args → interactive if TTY, help otherwise
-  if (positional.length === 0) {
-    if (process.stdout.isTTY && process.stdin.isTTY) {
-      const client = getClient(flags);
-      await interactiveMode(client);
-    } else {
-      console.log(HELP);
-    }
-    return;
-  }
-
-  const [group, command, ...rest] = positional;
+async function run(argv = process.argv.slice(2)): Promise<ExitCode> {
+  let runtime = createRuntime({}, "help");
 
   try {
+    const parsed = parseArgs(argv);
+    const flags = normalizeFlags(parsed.flags);
+    const positional = parsed.positional;
+    runtime = createRuntime(flags, resolveCommandName(positional, flags));
+    activeRuntime = runtime;
+
+    if (flags["help"] === true || flags["h"] === true || positional[0] === "help") {
+      emitSuccess("help", getHelpData(), flags, () => {
+        console.log(HELP);
+      });
+      return EXIT_CODE.success;
+    }
+
+    if (positional[0] === "version") {
+      emitSuccess("version", getVersionData(), flags, () => {
+        console.log(CLI_VERSION);
+      });
+      return EXIT_CODE.success;
+    }
+
+    if (flags["interactive"] === true) {
+      if (runtime.agent) {
+        die("Interactive mode is unavailable in --agent mode.", {
+          code: "interactive_mode_unavailable",
+          exitCode: EXIT_CODE.interactiveOnly,
+        });
+      }
+      const client = getClient(flags);
+      await interactiveMode(client);
+      return EXIT_CODE.success;
+    }
+
+    if (positional.length === 0) {
+      if (!runtime.machine && process.stdout.isTTY && process.stdin.isTTY) {
+        const client = getClient(flags);
+        await interactiveMode(client);
+      } else {
+        emitSuccess("help", getHelpData(), flags, () => {
+          console.log(HELP);
+        });
+      }
+      return EXIT_CODE.success;
+    }
+
+    const [group, command, ...rest] = positional;
+
     switch (group) {
       case "login":
-        return await authLogin(flags);
+        await authLogin(flags);
+        return EXIT_CODE.success;
       case "inbox":
         switch (command) {
           case "create":
-            return await inboxCreate(flags);
+            await inboxCreate(flags);
+            return EXIT_CODE.success;
           case "list-msg":
-            return await inboxListMessages(rest, flags);
+            await inboxListMessages(rest, flags);
+            return EXIT_CODE.success;
           case "wait":
-            return await inboxWait(rest, flags);
+            await inboxWait(rest, flags);
+            return EXIT_CODE.success;
           default:
-            die(`Unknown inbox command: ${command}. Run 'postmx --help' for usage.`);
+            die(`Unknown inbox command: ${command}. Run 'postmx --help' for usage.`, {
+              code: "unknown_command",
+              exitCode: EXIT_CODE.usage,
+            });
         }
         break;
       case "auth":
         switch (command) {
           case "login":
-            return await authLogin(flags);
+            await authLogin(flags);
+            return EXIT_CODE.success;
           case "logout":
-            return await authLogout(flags);
+            await authLogout(flags);
+            return EXIT_CODE.success;
           default:
-            die(`Unknown auth command: ${command}. Run 'postmx --help' for usage.`);
+            die(`Unknown auth command: ${command}. Run 'postmx --help' for usage.`, {
+              code: "unknown_command",
+              exitCode: EXIT_CODE.usage,
+            });
         }
         break;
       case "messages":
         switch (command) {
           case "list":
-            return await messagesList(flags);
+            await messagesList(flags);
+            return EXIT_CODE.success;
           default:
-            die(`Unknown messages command: ${command}. Run 'postmx --help' for usage.`);
+            die(`Unknown messages command: ${command}. Run 'postmx --help' for usage.`, {
+              code: "unknown_command",
+              exitCode: EXIT_CODE.usage,
+            });
         }
         break;
       case "message":
         switch (command) {
           case "get":
-            return await messageGet(rest, flags);
+            await messageGet(rest, flags);
+            return EXIT_CODE.success;
           default:
-            die(`Unknown message command: ${command}. Run 'postmx --help' for usage.`);
+            die(`Unknown message command: ${command}. Run 'postmx --help' for usage.`, {
+              code: "unknown_command",
+              exitCode: EXIT_CODE.usage,
+            });
         }
         break;
       case "webhook":
         switch (command) {
           case "create":
-            return await webhookCreate(flags);
+            await webhookCreate(flags);
+            return EXIT_CODE.success;
           default:
-            die(`Unknown webhook command: ${command}. Run 'postmx --help' for usage.`);
+            die(`Unknown webhook command: ${command}. Run 'postmx --help' for usage.`, {
+              code: "unknown_command",
+              exitCode: EXIT_CODE.usage,
+            });
         }
         break;
       default:
-        die(`Unknown command: ${group}. Run 'postmx --help' for usage.`);
+        die(`Unknown command: ${group}. Run 'postmx --help' for usage.`, {
+          code: "unknown_command",
+          exitCode: EXIT_CODE.usage,
+        });
     }
-  } catch (err: unknown) {
-    if (err instanceof CliApiError) {
-      if (err.code === "plan_limit_reached" && err.nextAction?.type === "open_dashboard" && err.nextAction.url) {
-        die(`Plan limit reached. Open ${err.nextAction.url} to upgrade or manage billing${requestIdSuffix(err.requestId)}.`);
-      }
-      die(formatCliApiError(err));
-    }
-    if (err instanceof PostMXApiError) {
-      die(`${err.message}${requestIdSuffix(err.requestId)}`);
-    }
-    if (err instanceof Error) {
-      die(err.message);
-    }
-    die(String(err));
+
+    return EXIT_CODE.success;
+  } catch (error) {
+    return emitFailure(error, runtime);
+  } finally {
+    activeRuntime = undefined;
   }
+}
+
+async function main(): Promise<void> {
+  process.exitCode = await run();
 }
 
 function isMainInvocation(entryArg: string | undefined, moduleUrl = import.meta.url): boolean {
@@ -2512,14 +3038,23 @@ if (isMainModule) {
 }
 
 export {
+  buildErrorEnvelope,
+  buildSuccessEnvelope,
   cliAuthHeaders,
   createInboxWithRetry,
   createCallbackListener,
+  createRuntime,
+  emitFailure,
   formatCliApiError,
+  getHelpData,
+  getVersionData,
   isMainInvocation,
+  normalizeError,
+  normalizeFlags,
   normalizeAuthSuccess,
   parseScopesFlag,
   parseTemporaryInboxTtl,
   promptSecret,
   postCliAuthJson,
+  run,
 };

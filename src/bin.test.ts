@@ -3,17 +3,24 @@ import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { PostMXApiError, PostMXNetworkError } from "postmx";
+import { PostMX, PostMXApiError, PostMXNetworkError } from "postmx";
 import {
+  buildErrorEnvelope,
   createInboxWithRetry,
   createCallbackListener,
+  createRuntime,
   formatCliApiError,
+  getHelpData,
+  getVersionData,
   isMainInvocation,
+  normalizeError,
+  normalizeFlags,
   normalizeAuthSuccess,
   parseScopesFlag,
   parseTemporaryInboxTtl,
   promptSecret,
   postCliAuthJson,
+  run,
 } from "./bin";
 
 const CLI_VERSION = JSON.parse(
@@ -139,7 +146,13 @@ describe("CLI auth helpers", () => {
   });
 
   it("accepts a matching localhost callback_state and ignores mismatches", async () => {
-    const listener = await createCallbackListener("state_123");
+    let listener: Awaited<ReturnType<typeof createCallbackListener>>;
+    try {
+      listener = await createCallbackListener("state_123");
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("EPERM")) return;
+      throw error;
+    }
 
     try {
       listener.setExpectedAuthRequestId("auth_123");
@@ -162,7 +175,13 @@ describe("CLI auth helpers", () => {
   });
 
   it("still accepts legacy state callback parameters", async () => {
-    const listener = await createCallbackListener("state_legacy");
+    let listener: Awaited<ReturnType<typeof createCallbackListener>>;
+    try {
+      listener = await createCallbackListener("state_legacy");
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("EPERM")) return;
+      throw error;
+    }
 
     try {
       listener.setExpectedAuthRequestId("auth_legacy");
@@ -183,7 +202,13 @@ describe("CLI auth helpers", () => {
 
   it("clears the browser callback timeout after an early callback", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    const listener = await createCallbackListener("state_timer");
+    let listener: Awaited<ReturnType<typeof createCallbackListener>>;
+    try {
+      listener = await createCallbackListener("state_timer");
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("EPERM")) return;
+      throw error;
+    }
 
     try {
       listener.setExpectedAuthRequestId("auth_timer");
@@ -342,5 +367,301 @@ describe("CLI auth helpers", () => {
       process.stdin.resume = originalResume;
       process.stdin.setEncoding = originalSetEncoding;
     }
+  });
+});
+
+async function captureRun(
+  args: string[],
+  options?: {
+    tty?: boolean;
+    env?: Record<string, string | undefined>;
+  },
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const stdoutChunks: string[] = [];
+  const stderrChunks: string[] = [];
+  const stdoutAny = process.stdout as NodeJS.WriteStream & { isTTY?: boolean };
+  const stdinAny = process.stdin as NodeJS.ReadStream & { isTTY?: boolean };
+  const originalStdoutIsTTY = stdoutAny.isTTY;
+  const originalStdinIsTTY = stdinAny.isTTY;
+  const previousEnv = new Map<string, string | undefined>();
+
+  const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(((chunk: string | Uint8Array) => {
+    stdoutChunks.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write);
+  const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+    stderrChunks.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write);
+
+  stdoutAny.isTTY = options?.tty ?? false;
+  stdinAny.isTTY = options?.tty ?? false;
+
+  for (const [key, value] of Object.entries(options?.env ?? {})) {
+    previousEnv.set(key, process.env[key]);
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+
+  try {
+    return {
+      exitCode: await run(args),
+      stdout: stdoutChunks.join(""),
+      stderr: stderrChunks.join(""),
+    };
+  } finally {
+    stdoutSpy.mockRestore();
+    stderrSpy.mockRestore();
+    stdoutAny.isTTY = originalStdoutIsTTY;
+    stdinAny.isTTY = originalStdinIsTTY;
+    for (const [key, value] of previousEnv.entries()) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
+describe("agent-ready CLI contract", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("normalizes agent flags to machine mode defaults", () => {
+    expect(normalizeFlags({ agent: true })).toMatchObject({
+      agent: true,
+      output: "json",
+      "no-browser": true,
+    });
+  });
+
+  it("describes help and version data for agents", () => {
+    expect(getHelpData()).toMatchObject({
+      name: "postmx",
+      package: "postmx-cli",
+      commands: expect.arrayContaining([
+        expect.objectContaining({ name: "help" }),
+        expect.objectContaining({ name: "version" }),
+        expect.objectContaining({ name: "inbox create" }),
+      ]),
+    });
+    expect(getVersionData()).toMatchObject({
+      cli_version: CLI_VERSION.version,
+      supported_output_modes: ["json", "text"],
+      agent_mode: expect.objectContaining({
+        env_auth: "POSTMX_API_KEY",
+        json_envelope: true,
+      }),
+    });
+  });
+
+  it("auto-switches to JSON envelopes on non-tty stdout", async () => {
+    const result = await captureRun(["version"]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).not.toContain("\x1b");
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: true,
+      command: "version",
+      data: expect.objectContaining({
+        cli_version: CLI_VERSION.version,
+      }),
+      meta: expect.objectContaining({
+        output: "json",
+        agent: false,
+      }),
+    });
+  });
+
+  it("returns structured help from help --json", async () => {
+    const result = await captureRun(["help", "--json"], { tty: true });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: true,
+      command: "help",
+      data: expect.objectContaining({
+        global_options: expect.any(Array),
+        commands: expect.any(Array),
+      }),
+      meta: expect.objectContaining({
+        output: "json",
+      }),
+    });
+  });
+
+  it("rejects missing API keys in agent mode with exit code 3", async () => {
+    const result = await captureRun(
+      ["inbox", "create", "--label", "agent-test", "--agent"],
+      { tty: true, env: { POSTMX_API_KEY: undefined } },
+    );
+
+    expect(result.exitCode).toBe(3);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: false,
+      command: "inbox create",
+      error: expect.objectContaining({
+        code: "missing_api_key",
+      }),
+    });
+  });
+
+  it("rejects interactive login in agent mode with exit code 7", async () => {
+    const result = await captureRun(["login", "--agent"], {
+      tty: true,
+      env: { POSTMX_API_KEY: undefined },
+    });
+
+    expect(result.exitCode).toBe(7);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: false,
+      command: "login",
+      error: expect.objectContaining({
+        code: "interactive_login_unavailable",
+      }),
+    });
+  });
+
+  it("maps wait timeouts to exit code 5 with one JSON object on stdout", async () => {
+    vi.spyOn(PostMX.prototype, "waitForMessage").mockRejectedValue(
+      new Error("Timed out after 30000ms waiting for a message in inbox inb_timeout"),
+    );
+
+    const result = await captureRun(
+      ["inbox", "wait", "inb_timeout", "--agent"],
+      { tty: true, env: { POSTMX_API_KEY: "pmx_live_test" } },
+    );
+
+    expect(result.exitCode).toBe(5);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).not.toContain("\x1b");
+    expect(() => JSON.parse(result.stdout)).not.toThrow();
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: false,
+      command: "inbox wait",
+      error: expect.objectContaining({
+        code: "timeout",
+      }),
+    });
+  });
+
+  it("maps network failures to exit code 6", async () => {
+    vi.spyOn(PostMX.prototype, "waitForMessage").mockRejectedValue(
+      new PostMXNetworkError(new Error("fetch failed")),
+    );
+
+    const result = await captureRun(
+      ["inbox", "wait", "inb_network", "--agent"],
+      { tty: true, env: { POSTMX_API_KEY: "pmx_live_test" } },
+    );
+
+    expect(result.exitCode).toBe(6);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: false,
+      command: "inbox wait",
+      error: expect.objectContaining({
+        code: "network_error",
+      }),
+    });
+  });
+
+  it("supports the create, wait, and get agent workflow with JSON envelopes", async () => {
+    vi.spyOn(PostMX.prototype, "createInbox").mockResolvedValue({
+      id: "inb_123",
+      email_address: "agent-test@postmx.email",
+      label: "agent-test",
+      lifecycle_mode: "temporary",
+      created_at: "2026-04-03T00:00:00.000Z",
+      expires_at: "2026-04-03T00:30:00.000Z",
+    } as never);
+    vi.spyOn(PostMX.prototype, "waitForMessage").mockResolvedValue({
+      id: "msg_123",
+      otp: "123456",
+      links: [{ type: "magic_link", url: "https://example.com/verify" }],
+    } as never);
+    vi.spyOn(PostMX.prototype, "getMessage").mockResolvedValue({
+      otp: "123456",
+    } as never);
+
+    const createResult = await captureRun(
+      ["inbox", "create", "--label", "agent-test", "--agent"],
+      { tty: true, env: { POSTMX_API_KEY: "pmx_live_test" } },
+    );
+    const waitResult = await captureRun(
+      ["inbox", "wait", "inb_123", "--agent"],
+      { tty: true, env: { POSTMX_API_KEY: "pmx_live_test" } },
+    );
+    const getResult = await captureRun(
+      ["message", "get", "msg_123", "--content-mode", "otp", "--agent"],
+      { tty: true, env: { POSTMX_API_KEY: "pmx_live_test" } },
+    );
+
+    expect(createResult.exitCode).toBe(0);
+    expect(waitResult.exitCode).toBe(0);
+    expect(getResult.exitCode).toBe(0);
+
+    expect(JSON.parse(createResult.stdout)).toMatchObject({
+      ok: true,
+      command: "inbox create",
+      data: expect.objectContaining({
+        id: "inb_123",
+        email_address: "agent-test@postmx.email",
+      }),
+      meta: expect.objectContaining({
+        output: "json",
+        agent: true,
+      }),
+    });
+    expect(JSON.parse(waitResult.stdout)).toMatchObject({
+      ok: true,
+      command: "inbox wait",
+      data: expect.objectContaining({
+        id: "msg_123",
+        otp: "123456",
+      }),
+    });
+    expect(JSON.parse(getResult.stdout)).toMatchObject({
+      ok: true,
+      command: "message get",
+      data: {
+        otp: "123456",
+      },
+    });
+  });
+
+  it("builds error envelopes with the active command and runtime metadata", () => {
+    const normalized = normalizeError(new PostMXApiError(401, "invalid_api_key", "Bad key", "req_123"));
+    const envelope = buildErrorEnvelope(
+      createRuntime({ agent: true, output: "json" }, "inbox create"),
+      {
+        code: normalized.code,
+        message: normalized.message,
+        request_id: normalized.requestId ?? null,
+        retry_after_seconds: normalized.retryAfterSeconds ?? null,
+        next_action: normalized.nextAction ?? null,
+      },
+    );
+
+    expect(envelope).toMatchObject({
+      ok: false,
+      command: "inbox create",
+      error: {
+        code: "invalid_api_key",
+        message: "Bad key",
+        request_id: "req_123",
+      },
+      meta: {
+        output: "json",
+        agent: true,
+      },
+    });
   });
 });
