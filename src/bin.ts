@@ -10,11 +10,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { PostMX, PostMXApiError, PostMXNetworkError, type Inbox } from "postmx";
 
 const DEFAULT_BASE_URL = "https://api.postmx.co";
-const DEFAULT_CLI_VERSION = "0.1.1";
+const DEFAULT_CLI_VERSION = "0.1.8";
 const CLI_CLIENT_NAME = "cli";
 const CLI_CALLBACK_HOST = "127.0.0.1";
 const CLI_CALLBACK_PATH = "/auth/cli/complete";
 const CLI_CALLBACK_TIMEOUT_MS = 90_000;
+const CLI_CALLBACK_LISTEN_RETRIES = 3;
 const CLI_AUTH_TIMEOUT_MS = 20_000;
 const CLI_AUTH_DEFAULT_LABEL = "PostMX CLI";
 const CLI_AUTH_NEXT_DASHBOARD_PATH = "/auth/cli/complete";
@@ -24,6 +25,8 @@ const DEFAULT_TEMPORARY_INBOX_TTL_MINUTES = 30;
 const CREATE_INBOX_RETRY_TIMEOUT_MS = 90_000;
 const CREATE_INBOX_ATTEMPT_TIMEOUT_MS = 20_000;
 const CREATE_INBOX_RETRY_DELAY_MS = 2_000;
+const WATCH_POLL_INTERVAL_MS = 2_000;
+const CLI_TITLE = "postmx beta";
 
 function resolveCliVersion(): string {
   try {
@@ -64,6 +67,40 @@ function trunc(s: string, n: number): string {
 function fit(s: string, n: number): string {
   return trunc(s, n).padEnd(n);
 }
+
+async function withSpinner<T>(label: string, task: () => Promise<T>): Promise<T> {
+  if (!process.stdout.isTTY) {
+    return await task();
+  }
+
+  const frames = ["·  ", "•• ", "•••", " ••", "  •"];
+  let frame = 0;
+  processStdout.write(`${label} ${dim(frames[frame] ?? "")}`);
+
+  const timer = setInterval(() => {
+    frame = (frame + 1) % frames.length;
+    processStdout.write(`\r${S.el}${label} ${dim(frames[frame] ?? "")}`);
+  }, 160);
+
+  try {
+    const result = await task();
+    processStdout.write(`\r${S.el}${label}\n`);
+    return result;
+  } catch (error) {
+    processStdout.write(`\r${S.el}`);
+    throw error;
+  } finally {
+    clearInterval(timer);
+  }
+}
+
+type SecretPromptOptions = {
+  helpText?: string;
+  maxLength?: number;
+  submitOnMaxLength?: boolean;
+  validateChar?: (char: string, nextValue: string) => boolean;
+  renderValue?: (value: string) => string;
+};
 
 type MessageFeedResult = {
   messages: Array<Record<string, unknown>>;
@@ -197,7 +234,7 @@ function normalizeBaseUrl(baseUrl?: string | null, fallback = DEFAULT_BASE_URL):
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 const HELP = `
-postmx — CLI for the PostMX email testing API
+postmx beta — CLI for the PostMX email testing API
 
 Usage:
   postmx <command> [options]
@@ -327,16 +364,48 @@ function validateIso8601(value: string): string {
   return parsed.toISOString();
 }
 
-function parseTemporaryInboxTtl(value: string | undefined): number | undefined {
+function validateTemporaryInboxTtl(value: string | undefined): number | undefined {
   if (value === undefined || value.trim() === "") {
     return DEFAULT_TEMPORARY_INBOX_TTL_MINUTES;
   }
 
   const ttl = Number.parseInt(value, 10);
   if (!Number.isInteger(ttl) || ttl < 10 || ttl > 60) {
-    die("Temporary inbox TTL must be an integer between 10 and 60 minutes.");
+    throw new Error("Temporary inbox TTL must be an integer between 10 and 60 minutes.");
   }
   return ttl;
+}
+
+function parseTemporaryInboxTtl(value: string | undefined): number | undefined {
+  try {
+    return validateTemporaryInboxTtl(value);
+  } catch (error) {
+    die(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function parseLifecycleMode(
+  value: string | undefined,
+  fallback: "temporary" | "persistent" = "temporary",
+): "temporary" | "persistent" {
+  const normalized = value?.trim() || fallback;
+  if (normalized === "temporary" || normalized === "persistent") {
+    return normalized;
+  }
+  die("Lifecycle mode must be either `temporary` or `persistent`.");
+}
+
+function finalizeCommandInput(): void {
+  try {
+    processStdin.setRawMode?.(false);
+  } catch {
+    // Ignore TTY reset failures during shutdown.
+  }
+  try {
+    processStdin.pause();
+  } catch {
+    // Ignore pause failures during shutdown.
+  }
 }
 
 function randomState(): string {
@@ -403,9 +472,17 @@ function tryMacosKeychainRead(): string | undefined {
 }
 
 function tryMacosKeychainWrite(apiKey: string): SavedCredentialLocation | undefined {
-  void apiKey;
   if (process.platform !== "darwin") return undefined;
-  return undefined;
+  try {
+    execFileSync(
+      "security",
+      ["add-generic-password", "-U", "-a", CLI_KEYCHAIN_ACCOUNT, "-s", CLI_KEYCHAIN_SERVICE, "-w", apiKey],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+    return { store: "macos-keychain", location: "macOS Keychain" };
+  } catch {
+    return undefined;
+  }
 }
 
 function tryMacosKeychainDelete(): void {
@@ -614,12 +691,35 @@ async function promptLine(query: string): Promise<string> {
   }
 }
 
-async function promptSecret(query: string): Promise<string> {
+function isRawInteractivePromptAvailable(): boolean {
+  return isInteractivePromptAvailable() && typeof process.stdin.setRawMode === "function";
+}
+
+function renderOtpSlots(value: string, length: number): string {
+  return Array.from({ length }, (_, index) => (
+    index < value.length ? cyan("●") : dim("○")
+  )).join(" ");
+}
+
+async function promptSecret(query: string, options?: SecretPromptOptions): Promise<string> {
   if (!isInteractivePromptAvailable() || typeof process.stdin.setRawMode !== "function") {
     die("Secure code entry requires an interactive terminal.");
   }
 
-  processStdout.write(query);
+  const renderValue = options?.renderValue ?? ((value: string) => "•".repeat(value.length));
+  const redraw = (value: string) => {
+    processStdout.write(`\r${S.el}  ${renderValue(value)}`);
+  };
+
+  if (options) {
+    processStdout.write(`${bold(query)}\n`);
+    if (options.helpText) {
+      processStdout.write(`  ${dim(options.helpText)}\n`);
+    }
+    redraw("");
+  } else {
+    processStdout.write(query);
+  }
   processStdin.resume();
   processStdin.setEncoding("utf8");
 
@@ -648,6 +748,7 @@ async function promptSecret(query: string): Promise<string> {
         }
         if (char === "\x7f" || char === "\b") {
           value = value.slice(0, -1);
+          if (options) redraw(value);
           continue;
         }
         if (char === "\x1b") {
@@ -656,7 +757,20 @@ async function promptSecret(query: string): Promise<string> {
           return;
         }
         if (char.length === 1 && char.charCodeAt(0) >= 32) {
-          value += char;
+          const nextValue = value + char;
+          if (options?.validateChar && !options.validateChar(char, nextValue)) {
+            continue;
+          }
+          if (typeof options?.maxLength === "number" && nextValue.length > options.maxLength) {
+            continue;
+          }
+          value = nextValue;
+          if (options) redraw(value);
+          if (options?.submitOnMaxLength === true && typeof options.maxLength === "number" && value.length >= options.maxLength) {
+            cleanup();
+            resolve(value.trim());
+            return;
+          }
         }
       }
     };
@@ -700,6 +814,101 @@ async function promptForChoice(
       return Math.min(1, options.length - 1);
     }
     console.log(`Please enter a number between 1 and ${options.length}.`);
+  }
+}
+
+function drawLoginMethodPicker(
+  tui: TUI,
+  maskedEmail: string,
+  deliveryMethods: string[],
+  options: Array<{ label: string; description: string }>,
+  current: number,
+): void {
+  clear(tui);
+  const write = tui.stdout.write.bind(tui.stdout);
+
+  write(`\n  ${bold("Sign in to PostMX")}\n`);
+  write(`  ${dim("We sent a sign-in email with both an OTP and a magic link.")}\n\n`);
+  write(`  ${bold("Email")}     ${maskedEmail}\n`);
+  if (deliveryMethods.length > 0) {
+    write(`  ${bold("Delivery")}  ${deliveryMethods.join(", ")}\n`);
+  }
+  write(`\n  ${dim("Choose how you want to finish signing in.")}\n`);
+  write(`  ${dim("─".repeat(Math.min(tui.cols - 4, 64)))}\n\n`);
+
+  for (let index = 0; index < options.length; index++) {
+    const option = options[index];
+    const active = index === current;
+    const badge = active ? cyan(`[${index + 1}]`) : dim(`[${index + 1}]`);
+    const marker = active ? `${cyan("▸")} ` : "  ";
+    write(`  ${marker}${badge} ${active ? bold(option.label) : option.label}\n`);
+    write(`      ${active ? option.description : dim(option.description)}\n\n`);
+  }
+
+  write(`  ${dim("↑↓ switch · 1-2 choose · ↵ continue · esc cancel")}\n`);
+}
+
+async function promptForLoginMethod(
+  maskedEmail: string,
+  deliveryMethods: string[],
+  callbackListenerAvailable: boolean,
+): Promise<number> {
+  const options = callbackListenerAvailable
+    ? [
+        {
+          label: "Enter OTP now",
+          description: "Stay in the terminal and paste the 6-digit code from the email.",
+        },
+        {
+          label: "Open magic link in browser",
+          description: "Finish in the browser and let the CLI complete automatically when possible.",
+        },
+      ]
+    : [
+        {
+          label: "Enter OTP now",
+          description: "Stay in the terminal and paste the 6-digit code from the email.",
+        },
+        {
+          label: "Use magic link and paste the one-time CLI code",
+          description: "Open the email link in a browser, then paste the code shown in the dashboard.",
+        },
+      ];
+
+  if (!isRawInteractivePromptAvailable()) {
+    return await promptForChoice(
+      callbackListenerAvailable ? "Choose a sign-in method:" : "How would you like to finish signing in?",
+      options.map((option) => option.label),
+    );
+  }
+
+  const tui = setupTUI();
+  let current = 0;
+
+  try {
+    drawLoginMethodPicker(tui, maskedEmail, deliveryMethods, options, current);
+
+    while (true) {
+      const key = await readKey(tui);
+      if (key === "\x03" || key === "q" || key === "\x1b") {
+        throw new Error("Login cancelled.");
+      }
+      if (key === "\x1b[A" || key === "k") {
+        current = Math.max(0, current - 1);
+      } else if (key === "\x1b[B" || key === "j") {
+        current = Math.min(options.length - 1, current + 1);
+      } else if (key === "\r" || key === "\n") {
+        return current;
+      } else if (key === "1") {
+        return 0;
+      } else if (key === "2") {
+        return Math.min(1, options.length - 1);
+      }
+      drawLoginMethodPicker(tui, maskedEmail, deliveryMethods, options, current);
+    }
+  } finally {
+    clear(tui);
+    teardownTUI(tui);
   }
 }
 
@@ -781,6 +990,7 @@ async function createCallbackListener(expectedState: string): Promise<CliCallbac
   let server: Server | undefined;
   let resolved = false;
   let closed = false;
+  const sockets = new Set<import("node:net").Socket>();
   let resolveCallback: ((payload: CliCallbackPayload) => void) | undefined;
   const callbackPromise = new Promise<CliCallbackPayload>((resolve) => {
     resolveCallback = resolve;
@@ -788,6 +998,11 @@ async function createCallbackListener(expectedState: string): Promise<CliCallbac
 
   const closeServer = async (): Promise<void> => {
     if (!server || closed) return;
+    server.closeIdleConnections?.();
+    server.closeAllConnections?.();
+    for (const socket of sockets) {
+      socket.destroy();
+    }
     if (!server.listening) {
       closed = true;
       return;
@@ -800,54 +1015,83 @@ async function createCallbackListener(expectedState: string): Promise<CliCallbac
 
   server = createServer((request, response) => {
     if (!isLoopbackAddress(request.socket.remoteAddress ?? undefined)) {
-      response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+      response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8", "Connection": "close" });
       response.end("Loopback requests only.");
       return;
     }
 
     const url = new URL(request.url ?? "/", `http://${request.headers.host ?? `${CLI_CALLBACK_HOST}:0`}`);
     if (url.pathname !== CLI_CALLBACK_PATH) {
-      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8", "Connection": "close" });
       response.end("Not found.");
       return;
     }
 
     const code = asNonEmptyString(url.searchParams.get("code"));
     const authRequestId = asNonEmptyString(url.searchParams.get("auth_request_id"));
-    const state = asNonEmptyString(url.searchParams.get("state"));
+    const state = asNonEmptyString(url.searchParams.get("callback_state"))
+      ?? asNonEmptyString(url.searchParams.get("state"));
 
     if (!code || !authRequestId) {
-      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8", "Connection": "close" });
       response.end("Missing code or auth_request_id.");
       return;
     }
     if (state !== expectedState) {
-      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8", "Connection": "close" });
       response.end("Invalid callback state.");
       return;
     }
     if (expectedAuthRequestId && authRequestId !== expectedAuthRequestId) {
-      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8", "Connection": "close" });
       response.end("Unexpected auth request.");
       return;
     }
     if (resolved) {
-      response.writeHead(409, { "Content-Type": "text/plain; charset=utf-8" });
+      response.writeHead(409, { "Content-Type": "text/plain; charset=utf-8", "Connection": "close" });
       response.end("Callback already received.");
       return;
     }
 
     resolved = true;
-    response.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    response.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Connection": "close" });
     response.end("PostMX CLI sign-in complete. You can return to your terminal.");
     resolveCallback?.({ code, authRequestId, state });
     void closeServer();
   });
-
-  await new Promise<void>((resolve, reject) => {
-    server?.once("error", reject);
-    server?.listen(0, CLI_CALLBACK_HOST, () => resolve());
+  server.keepAliveTimeout = 1;
+  server.headersTimeout = 5_000;
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => {
+      sockets.delete(socket);
+    });
   });
+
+  for (let attempt = 0; attempt < CLI_CALLBACK_LISTEN_RETRIES; attempt++) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error) => {
+          server?.removeListener("listening", onListening);
+          reject(error);
+        };
+        const onListening = () => {
+          server?.removeListener("error", onError);
+          resolve();
+        };
+
+        server?.once("error", onError);
+        server?.once("listening", onListening);
+        server?.listen(0, CLI_CALLBACK_HOST);
+      });
+      break;
+    } catch (error) {
+      const code = isRecord(error) ? asNonEmptyString(error.code) : undefined;
+      if (code !== "EADDRINUSE" || attempt === CLI_CALLBACK_LISTEN_RETRIES - 1) {
+        throw error;
+      }
+    }
+  }
 
   const address = server.address();
   if (!address || typeof address === "string") {
@@ -861,10 +1105,16 @@ async function createCallbackListener(expectedState: string): Promise<CliCallbac
       expectedAuthRequestId = authRequestId;
     },
     async waitForCallback(timeoutMs: number): Promise<CliCallbackPayload | null> {
-      return await Promise.race([
-        callbackPromise,
-        sleep(timeoutMs).then(() => null),
-      ]);
+      return await new Promise<CliCallbackPayload | null>((resolve) => {
+        const timer = setTimeout(() => {
+          resolve(null);
+        }, timeoutMs);
+
+        callbackPromise.then((payload) => {
+          clearTimeout(timer);
+          resolve(payload);
+        });
+      });
     },
     async close(): Promise<void> {
       await closeServer();
@@ -899,7 +1149,13 @@ async function verifyOtpLogin(
   challengeId: string,
   email: string,
 ): Promise<CliAuthFlowResult> {
-  const code = await promptSecret("6-digit OTP: ");
+  const code = await promptSecret("6-digit OTP", {
+    helpText: "Type digits or paste the code. The CLI will submit as soon as all 6 digits are entered.",
+    maxLength: 6,
+    submitOnMaxLength: true,
+    validateChar: (char) => /\d/.test(char),
+    renderValue: (value) => renderOtpSlots(value, 6),
+  });
   if (!/^\d{6}$/.test(code)) {
     die("OTP codes must be exactly 6 digits.");
   }
@@ -945,7 +1201,12 @@ async function promptForManualExchangeCode(
   email: string,
 ): Promise<CliAuthFlowResult> {
   for (let attempt = 0; attempt < 2; attempt++) {
-    const cliCode = await promptSecret("One-time CLI code: ");
+    const cliCode = await promptSecret("One-time CLI code", {
+      helpText: "Paste the code shown in the dashboard, then press Enter.",
+      renderValue: (value) => value.length > 0
+        ? `${cyan("●".repeat(Math.min(value.length, 24)))}${value.length > 24 ? dim(` +${value.length - 24}`) : ""}`
+        : dim("Paste code here"),
+    });
     if (cliCode.length === 0) {
       console.log("Please paste the one-time code shown in the dashboard.");
       continue;
@@ -973,14 +1234,21 @@ async function completeBrowserLogin(
   email: string,
 ): Promise<CliAuthFlowResult> {
   if (callbackListener) {
-    console.log(`Open the magic link from your email in a browser. Waiting for a localhost callback on ${callbackListener.callbackUrl} …`);
-    const callback = await callbackListener.waitForCallback(CLI_CALLBACK_TIMEOUT_MS);
+    console.log("Finish sign-in in your browser.");
+    if (isDebugEnabled(flags)) {
+      console.log(dim(`Debug: waiting for localhost callback on ${callbackListener.callbackUrl}`));
+    }
+    const callback = await withSpinner("Waiting for browser confirmation", async () => (
+      await callbackListener.waitForCallback(CLI_CALLBACK_TIMEOUT_MS)
+    ));
     if (callback) {
       if (callback.authRequestId !== authRequestId) {
         throw new Error("Received a callback for a different login attempt.");
       }
       try {
-        return await exchangeCliCode(flags, authRequestId, callback.code, email);
+        return await withSpinner("Completing sign-in", async () => (
+          await exchangeCliCode(flags, authRequestId, callback.code, email)
+        ));
       } catch (error) {
         if (!(error instanceof CliApiError && error.code === "invalid_exchange_code")) {
           throw error;
@@ -988,13 +1256,12 @@ async function completeBrowserLogin(
         console.log(formatCliApiError(error));
       }
     } else {
-      console.log("No browser callback reached the CLI. Falling back to manual code entry.");
+      console.log("Browser sign-in did not reach the CLI. Paste the one-time code from the dashboard.");
     }
   } else {
-    console.log("Open the magic link from your email in a browser. The dashboard will show a one-time CLI code.");
+    console.log("Finish sign-in in your browser, then paste the one-time code from the dashboard.");
   }
 
-  console.log("Paste the one-time CLI code shown in the dashboard to finish signing in.");
   return await promptForManualExchangeCode(flags, authRequestId, email);
 }
 
@@ -1002,11 +1269,14 @@ function printLoginStartMessage(
   maskedEmail: string,
   deliveryMethods: string[],
 ): void {
-  console.log("We sent you a sign-in email with both an OTP and a magic link.");
+  console.log("");
+  console.log(bold("Sign-in email sent"));
+  console.log("We sent a sign-in email with both an OTP and a magic link.");
   console.log(`Email: ${maskedEmail}`);
   if (deliveryMethods.length > 0) {
     console.log(`Delivery methods: ${deliveryMethods.join(", ")}`);
   }
+  console.log("");
 }
 
 function printLoginSuccess(
@@ -1062,17 +1332,19 @@ async function runEmailLogin(flags: Record<string, string | true>): Promise<void
     }
 
     try {
-      const startPayload = await postCliAuthJson<CliAuthStartResponse>(flags, "/v1/auth/cli/email/start", {
-        email,
-        ...(scopes ? { scopes } : {}),
-        ...(label ? { label } : {}),
-        ...(expiresAt ? { expires_at: expiresAt } : {}),
-        ...(callbackListener ? {
-          localhost_callback_url: callbackListener.callbackUrl,
-          callback_state: callbackState,
-        } : {}),
-        next_dashboard_path: CLI_AUTH_NEXT_DASHBOARD_PATH,
-      });
+      const startPayload = await withSpinner("Sending sign-in email", async () => (
+        await postCliAuthJson<CliAuthStartResponse>(flags, "/v1/auth/cli/email/start", {
+          email,
+          ...(scopes ? { scopes } : {}),
+          ...(label ? { label } : {}),
+          ...(expiresAt ? { expires_at: expiresAt } : {}),
+          ...(callbackListener ? {
+            localhost_callback_url: callbackListener.callbackUrl,
+            callback_state: callbackState,
+          } : {}),
+          next_dashboard_path: CLI_AUTH_NEXT_DASHBOARD_PATH,
+        })
+      ));
 
       const authRequestId = asNonEmptyString(startPayload.auth_request_id);
       const challengeId = asNonEmptyString(startPayload.challenge_id);
@@ -1083,15 +1355,13 @@ async function runEmailLogin(flags: Record<string, string | true>): Promise<void
       callbackListener?.setExpectedAuthRequestId(authRequestId);
 
       const maskedEmail = asNonEmptyString(startPayload.masked_email) ?? asNonEmptyString(startPayload.email) ?? email;
-      printLoginStartMessage(maskedEmail, describeDeliveryMethods(startPayload.delivery_methods));
+      const deliveryMethods = describeDeliveryMethods(startPayload.delivery_methods);
+      printLoginStartMessage(maskedEmail, deliveryMethods);
 
-      const choice = await promptForChoice(
-        noBrowser || !callbackListener
-          ? "How would you like to finish signing in?"
-          : "Choose a sign-in method:",
-        noBrowser || !callbackListener
-          ? ["Enter OTP now", "Use magic link in browser and paste the one-time code"]
-          : ["Enter OTP now", "Open magic link in browser"],
+      const choice = await promptForLoginMethod(
+        maskedEmail,
+        deliveryMethods,
+        !(noBrowser || !callbackListener),
       );
 
       const result = choice === 0
@@ -1126,40 +1396,48 @@ async function runEmailLogin(flags: Record<string, string | true>): Promise<void
 // ── Non-interactive commands ────────────────────────────────────────────────
 
 async function authLogin(flags: Record<string, string | true>): Promise<void> {
-  const apiKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
-  if (apiKey) {
-    try {
-      const savedLocation = saveApiKey(apiKey, readCliConfig());
-      if (flags["json"] === true || !process.stdout.isTTY) {
-        console.log(JSON.stringify({
-          success: true,
-          credential_store: savedLocation.store,
-          stored_at: savedLocation.location,
-          config_path: getConfigPath(),
-        }, null, 2));
-      } else {
-        console.log(`Saved API key in ${savedLocation.location}.`);
+  try {
+    const apiKey = typeof flags["api-key"] === "string" ? flags["api-key"] : undefined;
+    if (apiKey) {
+      try {
+        const savedLocation = saveApiKey(apiKey, readCliConfig());
+        if (flags["json"] === true || !process.stdout.isTTY) {
+          console.log(JSON.stringify({
+            success: true,
+            credential_store: savedLocation.store,
+            stored_at: savedLocation.location,
+            config_path: getConfigPath(),
+          }, null, 2));
+        } else {
+          console.log(`Saved API key in ${savedLocation.location}.`);
+        }
+        return;
+      } catch (err) {
+        die(`Could not save API key locally: ${err instanceof Error ? err.message : String(err)}`);
       }
-      return;
-    } catch (err) {
-      die(`Could not save API key locally: ${err instanceof Error ? err.message : String(err)}`);
     }
-  }
 
-  await runEmailLogin(flags);
+    await runEmailLogin(flags);
+  } finally {
+    finalizeCommandInput();
+  }
 }
 
 async function authLogout(flags: Record<string, string | true>): Promise<void> {
   try {
-    clearSavedApiKey();
-  } catch (err) {
-    die(`Could not remove saved API key: ${err instanceof Error ? err.message : String(err)}`);
-  }
+    try {
+      clearSavedApiKey();
+    } catch (err) {
+      die(`Could not remove saved API key: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
-  if (flags["json"] === true || !process.stdout.isTTY) {
-    console.log(JSON.stringify({ success: true, config_path: getConfigPath() }, null, 2));
-  } else {
-    console.log("Removed saved PostMX credentials.");
+    if (flags["json"] === true || !process.stdout.isTTY) {
+      console.log(JSON.stringify({ success: true, config_path: getConfigPath() }, null, 2));
+    } else {
+      console.log("Removed saved PostMX credentials.");
+    }
+  } finally {
+    finalizeCommandInput();
   }
 }
 
@@ -1225,7 +1503,9 @@ async function inboxCreate(flags: Record<string, string | true>): Promise<void> 
   const label = typeof flags["label"] === "string" ? flags["label"] : undefined;
   if (!label) die("--label is required");
 
-  const lifecycle_mode = (typeof flags["lifecycle"] === "string" ? flags["lifecycle"] : "temporary") as "temporary" | "persistent";
+  const lifecycle_mode = parseLifecycleMode(
+    typeof flags["lifecycle"] === "string" ? flags["lifecycle"] : undefined,
+  );
   const ttl = lifecycle_mode === "temporary"
     ? parseTemporaryInboxTtl(typeof flags["ttl"] === "string" ? flags["ttl"] : undefined)
     : undefined;
@@ -1521,12 +1801,35 @@ function formatMessageDetail(msg: Record<string, unknown>, cols: number): string
     }
   }
 
+  const analysis = isRecord(msg.analysis) ? msg.analysis : undefined;
+  if (analysis) {
+    lines.push("");
+    lines.push(`  ${bold("Analysis")}`);
+    lines.push(`    ${bold("Status")}          ${yellow(String(analysis.status ?? "none"))}`);
+    lines.push(`    ${bold("Eligible")}        ${analysis.eligible === true ? green("yes") : dim("no")}`);
+    if (analysis.detected_otp) lines.push(`    ${bold("Detected OTP")}    ${green(String(analysis.detected_otp))}`);
+    if (analysis.sender_name) lines.push(`    ${bold("Sender")}          ${analysis.sender_name}`);
+    if (analysis.category) lines.push(`    ${bold("Category")}        ${analysis.category}`);
+    if (analysis.extracted_id) lines.push(`    ${bold("Reference")}       ${analysis.extracted_id}`);
+    if (analysis.amount_mentioned) lines.push(`    ${bold("Amount")}          ${analysis.amount_mentioned}`);
+    if (typeof analysis.is_urgent === "boolean") {
+      lines.push(`    ${bold("Urgent")}          ${analysis.is_urgent ? green("yes") : dim("no")}`);
+    }
+    if (typeof analysis.action_required === "boolean") {
+      lines.push(`    ${bold("Action required")} ${analysis.action_required ? green("yes") : dim("no")}`);
+    }
+    if (analysis.summary) lines.push(`    ${bold("Summary")}         ${analysis.summary}`);
+    if (analysis.requested_at) lines.push(`    ${bold("Requested")}       ${analysis.requested_at}`);
+    if (analysis.completed_at) lines.push(`    ${bold("Completed")}       ${analysis.completed_at}`);
+  }
+
   return lines;
 }
 
 /** Format an inbox detail into compact lines. */
 function formatInboxDetail(inbox: Record<string, unknown>): string[] {
   const lines: string[] = [];
+  const messageAnalysis = isRecord(inbox.message_analysis) ? inbox.message_analysis : undefined;
   lines.push(`${bold("Inbox")}  ${dim("esc back · q quit")}`);
   lines.push("");
   lines.push(`  ${bold("ID")}       ${inbox.id}`);
@@ -1538,6 +1841,16 @@ function formatInboxDetail(inbox: Record<string, unknown>): string[] {
   lines.push(`  ${bold("Status")}   ${inbox.status}`);
   if (inbox.last_message_received_at) lines.push(`  ${bold("Last msg")} ${inbox.last_message_received_at}`);
   lines.push(`  ${bold("Created")}  ${inbox.created_at}`);
+  if (messageAnalysis) {
+    lines.push("");
+    lines.push(`  ${bold("Analysis")} ${yellow(String(messageAnalysis.mode ?? "disabled"))}`);
+    const recipients = Array.isArray(messageAnalysis.recipients)
+      ? messageAnalysis.recipients.filter((value): value is string => typeof value === "string" && value.length > 0)
+      : [];
+    if (recipients.length > 0) {
+      lines.push(`  ${bold("Targets")}  ${recipients.join(", ")}`);
+    }
+  }
   return lines;
 }
 
@@ -1690,46 +2003,105 @@ async function browseMessageFeed(
     subtitle: string;
     emptyMessage: string;
     load: () => Promise<Array<Record<string, unknown>>>;
+    initialLive?: boolean;
   },
 ): Promise<boolean> {
   let messages: Array<Record<string, unknown>> = [];
   let selected = 0;
   let error: string | null = null;
-  let status = "Loading messages...";
+  let paused = false;
+  let lastUpdated = "Not refreshed yet";
+  let newCount = 0;
+  let initialized = false;
+  const knownIds = new Set<string>();
+  let nextPollAt = 0;
+  let isLive = options.initialLive === true;
 
   const refresh = async () => {
     const previousId = messages[selected] ? String(messages[selected].id) : undefined;
     try {
       const nextMessages = await options.load();
+      if (isLive) {
+        if (!initialized) {
+          for (const message of nextMessages) knownIds.add(String(message.id));
+          newCount = 0;
+        } else {
+          newCount = nextMessages.filter((message) => !knownIds.has(String(message.id))).length;
+          for (const message of nextMessages) knownIds.add(String(message.id));
+        }
+      } else {
+        newCount = 0;
+      }
       messages = nextMessages;
       selected = keepSelection(messages, previousId, selected);
       error = null;
-      status = `${messages.length} message${messages.length === 1 ? "" : "s"} loaded · press r to refresh`;
+      initialized = true;
+      lastUpdated = new Date().toLocaleTimeString();
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
-      status = "Unable to refresh right now";
     }
   };
 
   await refresh();
+  if (isLive) {
+    nextPollAt = Date.now() + WATCH_POLL_INTERVAL_MS;
+  }
 
   while (true) {
+    const polling = isLive
+      ? (paused ? yellow("Polling paused") : green("Polling on"))
+      : yellow("Polling off");
+    const status = isLive
+      ? `${polling} · every ${WATCH_POLL_INTERVAL_MS / 1000}s · ${messages.length} message${messages.length === 1 ? "" : "s"} · ${newCount} new · updated ${lastUpdated}`
+      : `${polling} · press p to start live polling · ${messages.length} message${messages.length === 1 ? "" : "s"} · updated ${lastUpdated}`;
+    const hint = isLive
+      ? "↑↓ move · ↵ details · p stop polling · space pause · r refresh · esc back · q quit"
+      : "↑↓ move · ↵ details · p start polling · r refresh · esc back · q quit";
+    const emptyMessage = isLive
+      ? "Waiting for messages. Live polling is on."
+      : `${options.emptyMessage} Press p to start live polling.`;
     drawMessageFeed(
       tui,
       options.title,
       options.subtitle,
       messages,
       selected,
-      "↑↓ move · ↵ details · r refresh · esc back · q quit",
-      { status, error, emptyMessage: options.emptyMessage },
+      hint,
+      { status: error ? undefined : status, error, emptyMessage },
     );
 
-    const key = await readKey(tui);
+    const waitMs = isLive && !paused ? Math.max(0, nextPollAt - Date.now()) : undefined;
+    const key = isLive ? await readKeyWithTimeout(tui, waitMs) : await readKey(tui);
+
+    if (key === null) {
+      await refresh();
+      nextPollAt = Date.now() + WATCH_POLL_INTERVAL_MS;
+      continue;
+    }
     if (key === "\x03" || key === "q") return false;
     if (key === "\x1b" || key === "\x1b[D" || key === "b") return true;
-    if (key === "r") {
-      status = "Refreshing…";
+    if (key === "p" || key === "l") {
+      isLive = !isLive;
+      paused = false;
+      newCount = 0;
+      initialized = false;
+      knownIds.clear();
       await refresh();
+      if (isLive) {
+        nextPollAt = Date.now() + WATCH_POLL_INTERVAL_MS;
+      }
+      continue;
+    }
+    if (isLive && key === " ") {
+      paused = !paused;
+      if (!paused) nextPollAt = Date.now() + WATCH_POLL_INTERVAL_MS;
+      continue;
+    }
+    if (key === "r") {
+      await refresh();
+      if (isLive) {
+        nextPollAt = Date.now() + WATCH_POLL_INTERVAL_MS;
+      }
       continue;
     }
     if (key === "\x1b[A" || key === "k") {
@@ -1793,7 +2165,7 @@ async function mainMenu(tui: TUI, client: PostMX): Promise<void> {
   ];
 
   while (true) {
-    const idx = await pick(tui, "postmx", items, "↑↓ · ↵ select · q quit");
+    const idx = await pick(tui, CLI_TITLE, items, "↑↓ · ↵ select · q quit");
     if (idx === -2 || idx === -1) return; // quit
 
     if (idx === 0) {
@@ -1866,9 +2238,8 @@ async function inboxesScreen(tui: TUI, client: PostMX): Promise<boolean> {
 async function inboxActionScreen(tui: TUI, client: PostMX, inbox: any): Promise<boolean> {
   const label = inbox.label ?? inbox.id;
   const actions = [
-    "Messages",
+    "Open",
     "Details",
-    "Watch (live poll)",
   ];
 
   while (true) {
@@ -1882,9 +2253,6 @@ async function inboxActionScreen(tui: TUI, client: PostMX, inbox: any): Promise<
     } else if (idx === 1) {
       const cont = await showDetail(tui, formatInboxDetail(inbox));
       if (!cont) return false;
-    } else if (idx === 2) {
-      const cont = await watchScreen(tui, client, inbox.id, label);
-      if (!cont) return false;
     }
   }
 }
@@ -1892,7 +2260,7 @@ async function inboxActionScreen(tui: TUI, client: PostMX, inbox: any): Promise<
 async function messagesScreen(tui: TUI, client: PostMX, inboxId: string, label: string): Promise<boolean> {
   return browseMessageFeed(tui, client, {
     title: label,
-    subtitle: "Inbox messages",
+    subtitle: "Inbox",
     emptyMessage: "No messages yet in this inbox.",
     load: async () => {
       const result = await client.listMessages(inboxId, { limit: 50 });
@@ -1901,131 +2269,91 @@ async function messagesScreen(tui: TUI, client: PostMX, inboxId: string, label: 
   });
 }
 
-async function watchScreen(tui: TUI, client: PostMX, inboxId: string, label: string): Promise<boolean> {
-  let messages: Array<Record<string, unknown>> = [];
-  let selected = 0;
-  let error: string | null = null;
-  let paused = false;
-  let lastUpdated = "Not refreshed yet";
-  let newCount = 0;
-  let initialized = false;
-  const knownIds = new Set<string>();
-  let nextPollAt = 0;
-
-  const refresh = async () => {
-    const previousId = messages[selected] ? String(messages[selected].id) : undefined;
-    try {
+async function watchScreen(
+  tui: TUI,
+  client: PostMX,
+  inboxId: string,
+  label: string,
+  options?: { subtitle?: string },
+): Promise<boolean> {
+  return browseMessageFeed(tui, client, {
+    title: label,
+    subtitle: options?.subtitle ?? "Inbox",
+    emptyMessage: "Waiting for messages…",
+    initialLive: true,
+    load: async () => {
       const result = await client.listMessages(inboxId, { limit: 50 });
-      const nextMessages = result.messages as unknown as Array<Record<string, unknown>>;
-      if (!initialized) {
-        for (const message of nextMessages) knownIds.add(String(message.id));
-        newCount = 0;
-      } else {
-        newCount = nextMessages.filter((message) => !knownIds.has(String(message.id))).length;
-        for (const message of nextMessages) knownIds.add(String(message.id));
-      }
-      messages = nextMessages;
-      selected = keepSelection(messages, previousId, selected);
-      error = null;
-      initialized = true;
-      lastUpdated = new Date().toLocaleTimeString();
-    } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
-    }
-  };
-
-  await refresh();
-  nextPollAt = Date.now() + 2000;
-
-  while (true) {
-    const mode = paused ? yellow("paused") : green("live");
-    const status = `${mode} · ${messages.length} message${messages.length === 1 ? "" : "s"} · ${newCount} new · refreshed ${lastUpdated}`;
-    drawMessageFeed(
-      tui,
-      `${label} · watch`,
-      "Live inbox polling",
-      messages,
-      selected,
-      "↑↓ move · ↵ details · space pause · r refresh · esc back · q quit",
-      { status, error, emptyMessage: "Waiting for messages…" },
-    );
-
-    const waitMs = paused ? undefined : Math.max(0, nextPollAt - Date.now());
-    const key = await readKeyWithTimeout(tui, waitMs);
-
-    if (key === null) {
-      await refresh();
-      nextPollAt = Date.now() + 2000;
-      continue;
-    }
-    if (key === "\x03" || key === "q") return false;
-    if (key === "\x1b" || key === "\x1b[D" || key === "b") return true;
-    if (key === " ") {
-      paused = !paused;
-      if (!paused) nextPollAt = Date.now() + 2000;
-      continue;
-    }
-    if (key === "r") {
-      await refresh();
-      nextPollAt = Date.now() + 2000;
-      continue;
-    }
-    if (key === "\x1b[A" || key === "k") {
-      selected = Math.max(0, selected - 1);
-      continue;
-    }
-    if (key === "\x1b[B" || key === "j") {
-      selected = Math.min(Math.max(messages.length - 1, 0), selected + 1);
-      continue;
-    }
-    if ((key === "\r" || key === "\n") && messages.length > 0) {
-      const cont = await openSelectedMessage(tui, client, messages, selected);
-      if (!cont) return false;
-    }
-  }
+      return result.messages as unknown as Array<Record<string, unknown>>;
+    },
+  });
 }
 
 async function createInboxScreen(tui: TUI, client: PostMX): Promise<boolean> {
-  clear(tui);
   const w = tui.stdout.write.bind(tui.stdout);
 
-  // Simple inline prompts using raw mode
-  w(`${bold("Create inbox")}\n\n`);
+  let labelError: string | undefined;
+  let label: string | null = null;
+  while (true) {
+    clear(tui);
+    w(`${bold("Create inbox")}\n\n`);
+    if (labelError) {
+      w(`  ${red(labelError)}\n\n`);
+    }
+    const nextLabel = await prompt(tui, "  Label: ");
+    if (nextLabel === null) return true;
+    const normalized = nextLabel.trim();
+    if (normalized.length > 0) {
+      label = normalized;
+      break;
+    }
+    labelError = "A label is required.";
+  }
+  const finalLabel = label ?? "";
 
-  const label = await prompt(tui, "  Label: ");
-  if (label === null) return true; // cancelled
-
-  const modes = ["temporary", "persistent"];
-  w("\n");
-  const modeIdx = await pick(tui, "Lifecycle", modes, "↑↓ · ↵ select · esc cancel");
+  const modeChoices = [
+    { value: "temporary" as const, label: "temporary · auto-expire after 10-60 minutes" },
+    { value: "persistent" as const, label: "persistent · keep the inbox until you archive it" },
+  ];
+  clear(tui);
+  w(`${bold("Create inbox")}  ${dim(finalLabel)}\n\n`);
+  const modeIdx = await pick(
+    tui,
+    "Lifecycle",
+    modeChoices.map((choice) => choice.label),
+    "↑↓ · ↵ select · esc cancel",
+  );
   if (modeIdx === -2) return false;
   if (modeIdx === -1) return true;
-  const mode = modes[modeIdx] as "temporary" | "persistent";
+  const mode = modeChoices[modeIdx]?.value ?? "temporary";
 
   let ttl: number | undefined;
   if (mode === "temporary") {
-    clear(tui);
-    w(`${bold("Create inbox")}  ${dim(label)} · ${dim(mode)}\n\n`);
-    const ttlStr = await prompt(tui, `  TTL (minutes, empty=${DEFAULT_TEMPORARY_INBOX_TTL_MINUTES}): `);
-    if (ttlStr === null) return true;
-    ttl = parseTemporaryInboxTtl(ttlStr);
+    let ttlError: string | undefined;
+    while (true) {
+      clear(tui);
+      w(`${bold("Create inbox")}  ${dim(finalLabel)} · ${dim(mode)}\n\n`);
+      if (ttlError) {
+        w(`  ${red(ttlError)}\n\n`);
+      }
+      const ttlStr = await prompt(tui, `  TTL minutes (10-60, default ${DEFAULT_TEMPORARY_INBOX_TTL_MINUTES}): `);
+      if (ttlStr === null) return true;
+      try {
+        ttl = validateTemporaryInboxTtl(ttlStr);
+        break;
+      } catch (error) {
+        ttlError = error instanceof Error ? error.message : String(error);
+      }
+    }
   }
 
   clear(tui);
   w(dim("  Creating inbox..."));
 
   try {
-    const inbox = await createInboxWithRetry(client, { label, lifecycle_mode: mode, ttl_minutes: ttl });
-    const lines = [
-      `${bold("Inbox created")}  ${dim("esc back · q quit")}`,
-      "",
-      `  ${bold("ID")}       ${inbox.id}`,
-      `  ${bold("Email")}    ${cyan(inbox.email_address)}`,
-      `  ${bold("Mode")}     ${yellow(inbox.lifecycle_mode)}`,
-    ];
-    if (inbox.ttl_minutes) lines.push(`  ${bold("TTL")}      ${inbox.ttl_minutes}m`);
-    if (inbox.expires_at) lines.push(`  ${bold("Expires")}  ${inbox.expires_at}`);
-    return await showDetail(tui, lines);
+    const inbox = await createInboxWithRetry(client, { label: finalLabel, lifecycle_mode: mode, ttl_minutes: ttl });
+    return await watchScreen(tui, client, inbox.id, finalLabel, {
+      subtitle: `Inbox ready · ${inbox.email_address}`,
+    });
   } catch (err) {
     clear(tui);
     w(`${S.red}Error:${S.r} ${err instanceof Error ? err.message : String(err)}\n\n  ${dim("Press any key")}\n`);

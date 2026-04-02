@@ -138,17 +138,17 @@ describe("CLI auth helpers", () => {
     });
   });
 
-  it("accepts a matching localhost callback and ignores mismatches", async () => {
+  it("accepts a matching localhost callback_state and ignores mismatches", async () => {
     const listener = await createCallbackListener("state_123");
 
     try {
       listener.setExpectedAuthRequestId("auth_123");
       const pending = listener.waitForCallback(2_000);
 
-      const invalidResponse = await fetch(`${listener.callbackUrl}?code=cli_bad&auth_request_id=auth_123&state=wrong`);
+      const invalidResponse = await fetch(`${listener.callbackUrl}?code=cli_bad&auth_request_id=auth_123&callback_state=wrong`);
       expect(invalidResponse.status).toBe(400);
 
-      const validResponse = await fetch(`${listener.callbackUrl}?code=cli_good&auth_request_id=auth_123&state=state_123`);
+      const validResponse = await fetch(`${listener.callbackUrl}?code=cli_good&auth_request_id=auth_123&callback_state=state_123`);
       expect(validResponse.status).toBe(200);
 
       await expect(pending).resolves.toEqual({
@@ -156,6 +156,48 @@ describe("CLI auth helpers", () => {
         authRequestId: "auth_123",
         state: "state_123",
       });
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("still accepts legacy state callback parameters", async () => {
+    const listener = await createCallbackListener("state_legacy");
+
+    try {
+      listener.setExpectedAuthRequestId("auth_legacy");
+      const pending = listener.waitForCallback(2_000);
+
+      const validResponse = await fetch(`${listener.callbackUrl}?code=cli_legacy&auth_request_id=auth_legacy&state=state_legacy`);
+      expect(validResponse.status).toBe(200);
+
+      await expect(pending).resolves.toEqual({
+        code: "cli_legacy",
+        authRequestId: "auth_legacy",
+        state: "state_legacy",
+      });
+    } finally {
+      await listener.close();
+    }
+  });
+
+  it("clears the browser callback timeout after an early callback", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const listener = await createCallbackListener("state_timer");
+
+    try {
+      listener.setExpectedAuthRequestId("auth_timer");
+      const pending = listener.waitForCallback(90_000);
+
+      const validResponse = await fetch(`${listener.callbackUrl}?code=cli_timer&auth_request_id=auth_timer&callback_state=state_timer`);
+      expect(validResponse.status).toBe(200);
+
+      await expect(pending).resolves.toEqual({
+        code: "cli_timer",
+        authRequestId: "auth_timer",
+        state: "state_timer",
+      });
+      expect(vi.getTimerCount()).toBe(0);
     } finally {
       await listener.close();
     }
@@ -238,6 +280,57 @@ describe("CLI auth helpers", () => {
       await expect(pending).resolves.toBe("123456");
       expect(resume).toHaveBeenCalled();
       expect(setEncoding).toHaveBeenCalledWith("utf8");
+      expect(setRawMode).toHaveBeenCalledWith(true);
+      expect(setRawMode).toHaveBeenLastCalledWith(false);
+      expect(pause).toHaveBeenCalled();
+    } finally {
+      stdinAny.isTTY = originalIsTTYIn;
+      stdoutAny.isTTY = originalIsTTYOut;
+      stdinAny.setRawMode = originalSetRawMode;
+      process.stdin.pause = originalPause;
+      process.stdin.resume = originalResume;
+      process.stdin.setEncoding = originalSetEncoding;
+    }
+  });
+
+  it("auto-submits OTP entry once 6 digits are entered", async () => {
+    const stdinAny = process.stdin as NodeJS.ReadStream & {
+      isTTY?: boolean;
+      setRawMode?: (value: boolean) => void;
+      isRaw?: boolean;
+    };
+    const stdoutAny = process.stdout as NodeJS.WriteStream & { isTTY?: boolean };
+
+    const originalIsTTYIn = stdinAny.isTTY;
+    const originalIsTTYOut = stdoutAny.isTTY;
+    const originalSetRawMode = stdinAny.setRawMode;
+    const originalPause = process.stdin.pause;
+    const originalResume = process.stdin.resume;
+    const originalSetEncoding = process.stdin.setEncoding;
+
+    const setRawMode = vi.fn();
+    const pause = vi.fn();
+    const resume = vi.fn();
+    const setEncoding = vi.fn();
+
+    stdinAny.isTTY = true;
+    stdoutAny.isTTY = true;
+    stdinAny.isRaw = false;
+    stdinAny.setRawMode = setRawMode;
+    process.stdin.pause = pause as typeof process.stdin.pause;
+    process.stdin.resume = resume as typeof process.stdin.resume;
+    process.stdin.setEncoding = setEncoding as typeof process.stdin.setEncoding;
+
+    try {
+      const pending = promptSecret("6-digit OTP", {
+        maxLength: 6,
+        submitOnMaxLength: true,
+        validateChar: (char) => /\d/.test(char),
+      });
+
+      process.stdin.emit("data", "123456");
+
+      await expect(pending).resolves.toBe("123456");
       expect(setRawMode).toHaveBeenCalledWith(true);
       expect(setRawMode).toHaveBeenLastCalledWith(false);
       expect(pause).toHaveBeenCalled();
