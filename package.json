@@ -1,7 +1,7 @@
 {
   "name": "postmx-cli",
-  "version": "0.1.7",
-  "description": "PostMX CLI — manage inboxes, messages, and webhooks from your terminal",
+  "version": "0.1.8",
+  "description": "PostMX CLI beta — manage inboxes, messages, and webhooks from your terminal",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -27,7 +27,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "postmx": "^0.1.1"
+    "postmx": "^0.1.2"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

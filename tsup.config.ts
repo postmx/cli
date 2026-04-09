@@ -6,7 +6,7 @@ export default defineConfig({
   outDir: "dist",
   clean: true,
   sourcemap: true,
-  // Bundle everything into a single zero-dependency binary
-  noExternal: [/.*/],
+  // Keep the SDK as a normal runtime dependency for reliable package builds.
+  external: ["postmx"],
   banner: { js: "#!/usr/bin/env node" },
 });
